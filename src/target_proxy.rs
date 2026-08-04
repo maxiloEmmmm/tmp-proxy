@@ -1,6 +1,7 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use futures_util::{SinkExt, StreamExt};
 use sha1::{Digest, Sha1};
+use std::net::{IpAddr, SocketAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
@@ -10,41 +11,130 @@ use tokio_tungstenite::{
 use url::Url;
 
 use crate::cf_lib::{CfResponse, CfStream, IncomingRequest, RequestKind};
+use crate::connection_activity::ConnectionActivity;
 
 const WEBSOCKET_PATH: &str = "/tcp";
 
+/// Target selection policy for one tunnel request.
+///
+/// Example: daemon policy allows `port=2222`; GUI policy remains fixed.
+#[derive(Clone)]
+pub(crate) enum Target {
+    /// Fixed address used by GUI and headless xx modes.
+    Fixed {
+        /// Complete host and port passed to `TcpStream::connect`.
+        address: String,
+    },
+    /// Fixed daemon IP whose port may be overridden by the request URL.
+    PortOverride {
+        /// IP supplied through daemon `-ip` and never controlled by the URL.
+        ip: IpAddr,
+        /// Port used when the request URL omits `port`.
+        default_port: u16,
+    },
+}
+
+impl Target {
+    /// Creates a target that rejects URL port overrides.
+    ///
+    /// Example: `fixed("nas:22")` always connects to `nas:22`.
+    pub(crate) fn fixed(address: String) -> Self {
+        Self::Fixed { address }
+    }
+
+    /// Creates a daemon target with a fixed IP and request-selectable port.
+    ///
+    /// Example: IP `127.0.0.1`, default `22`, request `port=80` -> port 80.
+    pub(crate) fn with_port_override(ip: IpAddr, default_port: u16) -> Self {
+        Self::PortOverride { ip, default_port }
+    }
+
+    /// Resolves one request port under this target policy.
+    ///
+    /// Example: daemon target plus `Some(80)` -> `127.0.0.1:80`.
+    fn resolve(&self, requested_port: Option<u16>) -> Result<String, String> {
+        match self {
+            Self::Fixed { address } if requested_port.is_none() => Ok(address.clone()),
+            Self::Fixed { .. } => Err("target does not allow a port override".to_string()),
+            Self::PortOverride { ip, default_port } => {
+                Ok(SocketAddr::new(*ip, requested_port.unwrap_or(*default_port)).to_string())
+            }
+        }
+    }
+}
+
 /// Builds the public WSS URL containing the active access UUID.
 ///
-/// Example: host plus UUID -> a WSS URL carrying the stable `code` key.
-pub(crate) fn build_wss_url(hostname: &str, uuid: &str) -> Result<String, String> {
+/// Example: host, UUID and port 22 -> URL carrying `code` and `port`.
+pub(crate) fn build_wss_url(
+    hostname: &str,
+    uuid: &str,
+    port: Option<u16>,
+) -> Result<String, String> {
     let mut url = Url::parse(&format!("wss://{hostname}"))
         .map_err(|error| format!("build tunnel url failed: {error}"))?;
     url.set_path(WEBSOCKET_PATH);
-    url.query_pairs_mut().append_pair("code", uuid);
+    let mut query = url.query_pairs_mut();
+    query.append_pair("code", uuid);
+    if let Some(port) = port {
+        if port == 0 {
+            return Err("tunnel URL port must be 1..65535".to_string());
+        }
+        query.append_pair("port", &port.to_string());
+    }
+    drop(query);
     Ok(url.to_string())
 }
 
 /// Handles one authenticated Cloudflare WebSocket request.
 ///
-/// Example: matching UUID -> TCP connection to the configured target.
+/// Example: matching UUID plus tracker -> one counted target connection.
 pub(crate) async fn handle_request(
     request: IncomingRequest,
-    target: String,
+    target: Target,
     expected_uuid: String,
+    activity: Option<ConnectionActivity>,
 ) -> Result<(), String> {
-    if !uuid_matches(&request, &expected_uuid) {
+    let Some(request_url) = matching_request_url(&request, &expected_uuid) else {
         reject_request(request, 403).await?;
         return Ok(());
-    }
+    };
     if request.kind != RequestKind::WebSocket {
         reject_request(request, 404).await?;
         return Ok(());
     }
+    let requested_port = match extract_target_port(request_url) {
+        Ok(port) => port,
+        Err(_) => {
+            reject_request(request, 400).await?;
+            return Ok(());
+        }
+    };
+    let target = match target.resolve(requested_port) {
+        Ok(target) => target,
+        Err(_) => {
+            reject_request(request, 400).await?;
+            return Ok(());
+        }
+    };
 
     let accept = websocket_accept_value(&request)?;
     let tcp = TcpStream::connect(&target)
         .await
         .map_err(|error| format!("connect target {target} failed: {error}"))?;
+    let _connection_lease = match activity {
+        Some(activity) => match activity.try_begin() {
+            Some(lease) => Some(lease),
+            None => {
+                // 触发条件: 空闲刷新封口与已鉴权请求完成目标连接并发发生。
+                // 不能继续升级 WebSocket: 该 session 即将被主动关闭。
+                // 防止副作用: 拒绝迟到请求，避免刷新误杀一个新活跃连接。
+                reject_request(request, 503).await?;
+                return Ok(());
+            }
+        },
+        None => None,
+    };
     let mut response = CfResponse::new(101);
     response.headers.insert(
         http::header::SEC_WEBSOCKET_ACCEPT,
@@ -63,13 +153,43 @@ pub(crate) async fn handle_request(
 ///
 /// Example: `"/tcp?code=<uuid>" -> Some("<uuid>")`.
 pub(crate) fn extract_uuid(raw: &str) -> Option<String> {
-    let parsed = Url::parse(raw)
-        .or_else(|_| Url::parse(&format!("wss://tmp.local{raw}")))
-        .ok()?;
+    let parsed = parse_request_url(raw)?;
     parsed
         .query_pairs()
         .find(|(key, _)| key == "code")
         .map(|(_, value)| value.into_owned())
+}
+
+/// Extracts and validates the optional target `port` query value.
+///
+/// Example: `"/tcp?code=x&port=2222" -> Ok(Some(2222))`.
+pub(crate) fn extract_target_port(raw: &str) -> Result<Option<u16>, String> {
+    let parsed = parse_request_url(raw).ok_or_else(|| "request URL is invalid".to_string())?;
+    let mut ports = parsed
+        .query_pairs()
+        .filter(|(key, _)| key == "port")
+        .map(|(_, value)| value.into_owned());
+    let Some(raw_port) = ports.next() else {
+        return Ok(None);
+    };
+    if ports.next().is_some() {
+        return Err("request URL contains duplicate port values".to_string());
+    }
+    raw_port
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)
+        .map(Some)
+        .ok_or_else(|| "request URL port must be 1..65535".to_string())
+}
+
+/// Parses either a complete URL or the request path emitted by Cloudflare.
+///
+/// Example: `"/tcp?code=x"` is parsed against a temporary WSS origin.
+fn parse_request_url(raw: &str) -> Option<Url> {
+    Url::parse(raw)
+        .or_else(|_| Url::parse(&format!("wss://tmp.local{raw}")))
+        .ok()
 }
 
 /// Rejects one Cloudflare request before it reaches the target.
@@ -82,15 +202,15 @@ async fn reject_request(request: IncomingRequest, status: u16) -> Result<(), Str
         .map_err(|error| format!("respond rejection failed: {error}"))
 }
 
-/// Checks all URL-bearing Cloudflare metadata for the expected UUID.
+/// Finds URL-bearing Cloudflare metadata containing the expected UUID.
 ///
-/// Example: destination `?code=<uuid>` matches the expected UUID.
-fn uuid_matches(request: &IncomingRequest, expected: &str) -> bool {
+/// Example: matching destination returns that destination for port parsing.
+fn matching_request_url<'a>(request: &'a IncomingRequest, expected: &str) -> Option<&'a str> {
     // 触发条件: Cloudflare metadata 字段随入口协议变化。
     // 不能直接依赖单字段: QUIC 与 HTTP/2 提供的字段不同。
     // 防止副作用: 避免字段名差异导致正确 URL 被误拒。
     if extract_uuid(&request.destination).as_deref() == Some(expected) {
-        return true;
+        return Some(&request.destination);
     }
     request
         .metadata
@@ -99,7 +219,8 @@ fn uuid_matches(request: &IncomingRequest, expected: &str) -> bool {
             let key = key.to_ascii_lowercase();
             key.contains("path") || key.contains("uri") || key.contains("url")
         })
-        .any(|(_, value)| extract_uuid(value).as_deref() == Some(expected))
+        .find(|(_, value)| extract_uuid(value).as_deref() == Some(expected))
+        .map(|(_, value)| value.as_str())
 }
 
 /// Computes the RFC 6455 WebSocket accept value for a Cloudflare request.

@@ -1,5 +1,6 @@
 mod access_uuid;
 mod cf_lib;
+mod connection_activity;
 mod daemon;
 mod discovery;
 mod target_proxy;
@@ -636,7 +637,7 @@ async fn run_cf_tunnel(
     let quick_tunnel = cf_lib::create_quick_tunnel()
         .await
         .map_err(|err| format!("create tunnel failed: {err}"))?;
-    let wss_url = target_proxy::build_wss_url(&quick_tunnel.hostname, &pairing_uuid)?;
+    let wss_url = target_proxy::build_wss_url(&quick_tunnel.hostname, &pairing_uuid, None)?;
     let session = quick_tunnel.session;
     let mut events = session.events();
     let zz_command = build_default_zz_command(&wss_url, &username);
@@ -672,10 +673,15 @@ async fn run_cf_tunnel(
             },
             request = session.accept() => {
                 let request = request.map_err(|error| format!("accept tunnel request failed: {error}"))?;
-                let target = target.clone();
+                let target = target_proxy::Target::fixed(target.clone());
                 let pairing_uuid = pairing_uuid.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = target_proxy::handle_request(request, target, pairing_uuid).await {
+                    if let Err(error) = target_proxy::handle_request(
+                        request,
+                        target,
+                        pairing_uuid,
+                        None,
+                    ).await {
                         eprintln!("{error}");
                     }
                 });
@@ -829,6 +835,8 @@ fn validate_yy_url(wss_url: &str) -> Result<(), String> {
     {
         return Err("yy url must include ?code=<canonical UUID v4>".to_string());
     }
+    target_proxy::extract_target_port(wss_url)
+        .map_err(|error| format!("yy url has invalid port: {error}"))?;
     Ok(())
 }
 
