@@ -1,0 +1,26 @@
+[Unit]
+Description=tmp-proxy Cloudflare daemon
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+User=root
+ExecStart=/usr/local/bin/tmp-proxy -daemon -key demo -ip 127.0.0.1 -port 22 -discover-host 203.0.113.10:9000
+Restart=always
+RestartSec=5s
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

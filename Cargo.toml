@@ -1,0 +1,43 @@
+[package]
+name = "cf-demo-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "=0.8.4", default-features = false, features = ["http1", "json", "tokio"] }
+base64 = "0.21"
+bytes = "1.12.0"
+capnp = "0.27.0"
+capnp-rpc = "0.27.0"
+eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+futures = "0.3"
+futures-util = { version = "0.3.32", features = ["sink"] }
+h2 = "0.4.15"
+hickory-resolver = { version = "0.25.2", default-features = false, features = ["system-config", "tokio"] }
+hostname = { version = "=0.4.1", default-features = false }
+http = "1.4.0"
+quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider"] }
+rustls = { version = "0.23.41", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std"] }
+serde = { version = "1.0.228", features = ["derive"] }
+sha1 = "0.10"
+tokio = { version = "1.52.3", features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["aws_lc_rs"] }
+tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-native-roots"] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
+url = "2.5.8"
+uuid = { version = "1.18.1", features = ["v4"] }
+
+[build-dependencies]
+capnpc = "0.27.0"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = "z"
+panic = "abort"
+strip = true
+
+[[bin]]
+name = "tmp-proxy"
+path = "src/main.rs"
