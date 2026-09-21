@@ -1,6 +1,8 @@
 //! In-memory daemon discovery reporting and center service.
 
 pub(crate) mod center;
+pub(crate) mod config;
+pub(crate) mod kv;
 pub(crate) mod reporter;
 
 use serde::{Deserialize, Serialize};

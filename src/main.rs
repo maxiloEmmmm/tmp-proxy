@@ -60,12 +60,27 @@ enum LaunchMode {
     Center(discovery::center::Config),
 }
 
+/// Source used to resolve the WSS endpoint for yy/zz.
+///
+/// Example: `Kv { key: "cfp/demo", query: "port=544" }` -> one discovered URL.
+enum EndpointSpec {
+    /// A complete WSS URL supplied directly by the caller.
+    Url(String),
+    /// A complete Cloudflare KV key plus optional raw query suffix.
+    Kv {
+        /// Full KV key, including any configured prefix.
+        key: String,
+        /// Optional query string appended after the generated `code` query.
+        query: Option<String>,
+    },
+}
+
 /// Runtime configuration for yy mode.
 ///
 /// Example: `wss_url=wss://a.trycloudflare.com/tcp?code=<uuid>`.
 struct YyConfig {
-    /// WebSocket URL printed by the xx-side GUI.
-    wss_url: String,
+    /// WSS endpoint source.
+    endpoint: EndpointSpec,
     /// Local TCP listener address used by yy.
     listen_addr: String,
 }
@@ -84,8 +99,8 @@ struct XxConfig {
 ///
 /// Example: `tmp-proxy zz wss://x/tcp?code=<uuid> -- ssh -p {PORT} u@127.0.0.1`.
 struct ZzConfig {
-    /// WebSocket URL printed by the xx-side GUI.
-    wss_url: String,
+    /// WSS endpoint source.
+    endpoint: EndpointSpec,
     /// Command vector after `--`, with `{PORT}` placeholders.
     command: Vec<String>,
 }
@@ -207,24 +222,101 @@ fn parse_launch_mode(args: Vec<String>) -> Result<LaunchMode, String> {
             target: target.clone(),
             username: username.clone(),
         })),
-        [flag, wss_url] if flag == "-yy" => Ok(LaunchMode::Yy(YyConfig {
-            wss_url: wss_url.clone(),
+        [flag, rest @ ..] if flag == "-yy" => parse_yy_mode(rest),
+        [subcommand, rest @ ..] if subcommand == "zz" => parse_zz_mode(rest),
+        _ => Err(launch_usage()),
+    }
+}
+
+/// Parses yy's direct-URL and KV-key forms.
+///
+/// Example: `-kvk cfp/demo -query port=544` -> KV endpoint with query suffix.
+fn parse_yy_mode(args: &[String]) -> Result<LaunchMode, String> {
+    if args.first().map(String::as_str) == Some("-kvk") {
+        let key = args
+            .get(1)
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
+            .ok_or_else(launch_usage)?;
+        let mut query = None;
+        let mut listen_addr = DEFAULT_YY_LISTEN.to_string();
+        let mut index = 2;
+        while index < args.len() {
+            match args[index].as_str() {
+                "-query" if query.is_none() => {
+                    query = Some(
+                        args.get(index + 1)
+                            .filter(|value| !value.is_empty())
+                            .cloned()
+                            .ok_or_else(launch_usage)?,
+                    );
+                    index += 2;
+                }
+                _ if index + 1 == args.len() && listen_addr == DEFAULT_YY_LISTEN => {
+                    listen_addr = args[index].clone();
+                    index += 1;
+                }
+                _ => return Err(launch_usage()),
+            }
+        }
+        return Ok(LaunchMode::Yy(YyConfig {
+            endpoint: EndpointSpec::Kv { key, query },
+            listen_addr,
+        }));
+    }
+    match args {
+        [wss_url] => Ok(LaunchMode::Yy(YyConfig {
+            endpoint: EndpointSpec::Url(wss_url.clone()),
             listen_addr: DEFAULT_YY_LISTEN.to_string(),
         })),
-        [flag, wss_url, listen_addr] if flag == "-yy" => Ok(LaunchMode::Yy(YyConfig {
-            wss_url: wss_url.clone(),
+        [wss_url, listen_addr] => Ok(LaunchMode::Yy(YyConfig {
+            endpoint: EndpointSpec::Url(wss_url.clone()),
             listen_addr: listen_addr.clone(),
         })),
-        [subcommand, wss_url, separator, command @ ..]
-            if subcommand == "zz" && separator == "--" && !command.is_empty() =>
-        {
-            Ok(LaunchMode::Zz(ZzConfig {
-                wss_url: wss_url.clone(),
-                command: command.to_vec(),
-            }))
-        }
-        _ => Err("usage: tmp-proxy | tmp-proxy xx <target> <username> | tmp-proxy -yy <wss_url> [listen_addr] | tmp-proxy zz <wss_url> -- <command...> | tmp-proxy -daemon ... | tmp-proxy -center ...".to_string()),
+        _ => Err(launch_usage()),
     }
+}
+
+/// Parses zz's direct-URL and KV-key forms.
+///
+/// Example: `-kvk cfp/demo -- ssh -p {PORT}` -> KV-backed zz mode.
+fn parse_zz_mode(args: &[String]) -> Result<LaunchMode, String> {
+    let separator = args
+        .iter()
+        .position(|arg| arg == "--")
+        .ok_or_else(launch_usage)?;
+    if separator == 0 || separator + 1 >= args.len() {
+        return Err(launch_usage());
+    }
+    let endpoint_args = &args[..separator];
+    let command = args[separator + 1..].to_vec();
+    let endpoint = match endpoint_args {
+        [wss_url] => EndpointSpec::Url(wss_url.clone()),
+        [flag, key] if flag == "-kvk" && !key.trim().is_empty() => EndpointSpec::Kv {
+            key: key.clone(),
+            query: None,
+        },
+        [flag, key, query_flag, query]
+            if flag == "-kvk"
+                && query_flag == "-query"
+                && !key.trim().is_empty()
+                && !query.is_empty() =>
+        {
+            EndpointSpec::Kv {
+                key: key.clone(),
+                query: Some(query.clone()),
+            }
+        }
+        _ => return Err(launch_usage()),
+    };
+    Ok(LaunchMode::Zz(ZzConfig { endpoint, command }))
+}
+
+/// Returns the public command syntax.
+///
+/// Example: malformed `-kvk` arguments -> this usage string.
+fn launch_usage() -> String {
+    "usage: tmp-proxy | tmp-proxy xx <target> <username> | tmp-proxy -yy <wss_url> [listen_addr] | tmp-proxy -yy -kvk <full_kv_key> [-query <query>] [listen_addr] | tmp-proxy zz <wss_url> -- <command...> | tmp-proxy zz -kvk <full_kv_key> [-query <query>] -- <command...> | tmp-proxy -daemon ... | tmp-proxy -center ...".to_string()
 }
 
 /// Runs the native xx GUI.
@@ -712,7 +804,8 @@ fn shell_quote_single(raw: &str) -> String {
 ///
 /// Example: `tmp-proxy -yy wss://x/tcp?code=<uuid> 0.0.0.0:0`.
 async fn run_yy(config: YyConfig) -> Result<(), String> {
-    validate_yy_url(&config.wss_url)?;
+    let wss_url = resolve_endpoint(config.endpoint).await?;
+    validate_yy_url(&wss_url)?;
     let listener = TcpListener::bind(&config.listen_addr)
         .await
         .map_err(|err| format!("listen {} failed: {err}", config.listen_addr))?;
@@ -726,7 +819,7 @@ async fn run_yy(config: YyConfig) -> Result<(), String> {
             .accept()
             .await
             .map_err(|err| format!("accept failed: {err}"))?;
-        let wss_url = config.wss_url.clone();
+        let wss_url = wss_url.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_yy_tcp_connection(stream, &wss_url).await {
                 eprintln!("{peer}: {err}");
@@ -735,11 +828,56 @@ async fn run_yy(config: YyConfig) -> Result<(), String> {
     }
 }
 
+/// Resolves a direct WSS URL or reads one from a complete KV key.
+///
+/// Example: `Kv { key: "cfp/demo" }` -> `wss://host/tcp?code=<uuid>`.
+async fn resolve_endpoint(endpoint: EndpointSpec) -> Result<String, String> {
+    match endpoint {
+        EndpointSpec::Url(wss_url) => Ok(wss_url),
+        EndpointSpec::Kv { key, query } => {
+            let backend = discovery::config::load(None)?
+                .ok_or("KV endpoint requires a cf_kv reporter configuration")?;
+            let discovery::config::BackendConfig::CfKv(config) = backend else {
+                return Err("KV endpoint requires reporter.type: cf_kv".to_string());
+            };
+            let reader = discovery::kv::KvReader::new(config)?;
+            let endpoint = reader.read(&key).await?;
+            let wss_url = target_proxy::build_wss_url(&endpoint.hostname, &endpoint.code, None)?;
+            append_endpoint_query(&wss_url, query.as_deref())
+        }
+    }
+}
+
+/// Appends a caller-provided query string without allowing it to replace `code`.
+///
+/// Example: base URL plus `port=544` -> URL with `code=<uuid>&port=544`.
+fn append_endpoint_query(wss_url: &str, query: Option<&str>) -> Result<String, String> {
+    let Some(query) = query else {
+        return Ok(wss_url.to_string());
+    };
+    let query = query.trim().trim_start_matches('?').trim_start_matches('&');
+    if query.is_empty() || query.contains('#') || query.contains('?') {
+        return Err("-query must contain a non-empty query string without ? or #".to_string());
+    }
+    let mut url =
+        Url::parse(wss_url).map_err(|error| format!("invalid generated wss url: {error}"))?;
+    if url::form_urlencoded::parse(query.as_bytes()).any(|(key, _)| key == "code") {
+        return Err("-query must not override code".to_string());
+    }
+    let combined = match url.query() {
+        Some(existing) if !existing.is_empty() => format!("{existing}&{query}"),
+        _ => query.to_string(),
+    };
+    url.set_query(Some(&combined));
+    Ok(url.to_string())
+}
+
 /// Runs zz mode and exposes a local TCP listener for a child command.
 ///
 /// Example: `tmp-proxy zz wss://x -- ssh -p {PORT} u@127.0.0.1`.
 async fn run_zz(config: ZzConfig) -> Result<i32, String> {
-    validate_yy_url(&config.wss_url)?;
+    let wss_url = resolve_endpoint(config.endpoint).await?;
+    validate_yy_url(&wss_url)?;
     let listener = TcpListener::bind(DEFAULT_YY_LISTEN)
         .await
         .map_err(|err| format!("listen {DEFAULT_YY_LISTEN} failed: {err}"))?;
@@ -749,8 +887,7 @@ async fn run_zz(config: ZzConfig) -> Result<i32, String> {
     let command = replace_port_placeholders(config.command, addr.port());
     let mut child = spawn_zz_command(&command)?;
     let cancel = CancellationToken::new();
-    let mut accept_task =
-        tokio::spawn(run_zz_accept_loop(listener, config.wss_url, cancel.clone()));
+    let mut accept_task = tokio::spawn(run_zz_accept_loop(listener, wss_url, cancel.clone()));
 
     println!("listening {addr}");
     println!("running {}", command.join(" "));

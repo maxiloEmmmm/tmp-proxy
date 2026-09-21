@@ -1,0 +1,5 @@
+reporter:
+  type: cf_kv
+  token_env: CF_TOKEN
+  namespace: proxy
+  prefix: com

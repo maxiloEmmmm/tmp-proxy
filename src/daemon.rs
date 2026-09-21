@@ -2,7 +2,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
@@ -10,6 +10,8 @@ use tokio_util::sync::CancellationToken;
 use crate::access_uuid::AccessUuid;
 use crate::cf_lib::{self, SessionEvent};
 use crate::connection_activity::ConnectionActivity;
+use crate::discovery::config::{self, BackendConfig};
+use crate::discovery::kv::KvBackend;
 use crate::discovery::reporter::Reporter;
 use crate::target_proxy;
 
@@ -28,27 +30,45 @@ pub(crate) struct Config {
     pub(crate) target_ip: IpAddr,
     /// Target TCP port, defaulting to 22.
     pub(crate) target_port: u16,
-    /// Optional discovery center receiving periodic reports.
-    pub(crate) discover_host: Option<SocketAddr>,
+    /// Optional validated discovery backend, with CLI center precedence.
+    pub(crate) reporter: Option<BackendConfig>,
+    /// Keep the access UUID and Quick Tunnel hostname for this process lifetime.
+    pub(crate) constant_url: bool,
+}
+
+/// Reporter destination prepared once for all tunnel epochs.
+enum ActiveReporter {
+    /// Existing center socket address.
+    CustomCenter(SocketAddr),
+    /// KV backend whose resolved namespace survives tunnel refreshes.
+    CfKv(Arc<KvBackend>),
 }
 
 impl Config {
     /// Parses daemon flags and enforces required `-key` and `-ip` values.
     ///
-    /// Example: `-key nas -ip 10.0.0.2 -port 22` -> daemon config.
+    /// Example: `-key nas -ip 10.0.0.2 -const` -> constant-URL daemon config.
     pub(crate) fn parse(args: &[String]) -> Result<Self, String> {
-        if args.len() % 2 != 0 {
-            return Err(daemon_usage());
-        }
         let mut key = None;
         let mut target_ip = None;
         let mut target_port = DEFAULT_TARGET_PORT;
         let mut discover_host = None;
         let mut port_seen = false;
-        for pair in args.chunks_exact(2) {
-            match pair[0].as_str() {
+        let mut constant_url = false;
+        let mut index = 0;
+        while index < args.len() {
+            if args[index] == "-const" {
+                if constant_url {
+                    return Err(daemon_usage());
+                }
+                constant_url = true;
+                index += 1;
+                continue;
+            }
+            let value = args.get(index + 1).ok_or_else(daemon_usage)?;
+            match args[index].as_str() {
                 "-key" if key.is_none() => {
-                    let value = pair[1].trim();
+                    let value = value.trim();
                     if value.is_empty() {
                         return Err("daemon -key must not be empty".to_string());
                     }
@@ -56,28 +76,31 @@ impl Config {
                 }
                 "-ip" if target_ip.is_none() => {
                     target_ip = Some(
-                        pair[1]
+                        value
                             .parse()
                             .map_err(|error| format!("invalid daemon -ip: {error}"))?,
                     );
                 }
                 "-port" if !port_seen => {
-                    target_port = parse_port(&pair[1], "daemon -port")?;
+                    target_port = parse_port(value, "daemon -port")?;
                     port_seen = true;
                 }
                 "-discover-host" if discover_host.is_none() => {
-                    discover_host = Some(pair[1].parse().map_err(|error| {
+                    discover_host = Some(value.parse().map_err(|error| {
                         format!("invalid daemon -discover-host, expected ip:port: {error}")
                     })?);
                 }
                 _ => return Err(daemon_usage()),
             }
+            index += 2;
         }
+        let reporter = config::load(discover_host)?;
         Ok(Self {
             key: key.ok_or_else(daemon_usage)?,
             target_ip: target_ip.ok_or_else(daemon_usage)?,
             target_port,
-            discover_host,
+            reporter,
+            constant_url,
         })
     }
 
@@ -95,6 +118,20 @@ impl Config {
 pub(crate) async fn run(config: Config) -> Result<(), String> {
     let target = config.target_addr();
     check_target(target).await?;
+    let reporter_backend = match config.reporter {
+        Some(BackendConfig::CustomCenter(center)) => Some(ActiveReporter::CustomCenter(center)),
+        Some(BackendConfig::CfKv(kv_config)) => {
+            let kv = Arc::new(KvBackend::new(kv_config, &config.key)?);
+            if let Err(error) = kv.prepare().await {
+                // 触发条件: 启动时 Cloudflare namespace 暂时无法解析。
+                // 不能让 daemon 退出或立刻重试: 上报失败只记日志，等下一次正常上报。
+                // 防止副作用: discovery 故障不影响 tunnel 启动。
+                eprintln!("discovery report failed: {error}");
+            }
+            Some(ActiveReporter::CfKv(kv))
+        }
+        None => None,
+    };
     let access_uuid = Arc::new(RwLock::new(AccessUuid::generate()));
     let uuid_rotation = time::sleep(UUID_LIFETIME);
     tokio::pin!(uuid_rotation);
@@ -106,38 +143,62 @@ pub(crate) async fn run(config: Config) -> Result<(), String> {
         let cf_hostname = quick_tunnel.hostname;
         let session = quick_tunnel.session;
         let mut events = session.events();
-        let activity = ConnectionActivity::new();
+        // 触发条件: -const 禁用空闲刷新，连接活跃度不再影响 URL。
+        // 不能继续跟踪每条连接: 那只会增加不必要的锁操作。
+        // 防止副作用: 常量模式不为已停用的定时器维护状态。
+        let activity = (!config.constant_url).then(ConnectionActivity::new);
         let idle_activity = activity.clone();
-        let idle_refresh = idle_activity.seal_after_idle(CF_IDLE_LIFETIME);
+        let idle_refresh = async move {
+            if let Some(activity) = idle_activity {
+                activity.seal_after_idle(CF_IDLE_LIFETIME).await;
+            }
+        };
         tokio::pin!(idle_refresh);
         let reporter_shutdown = CancellationToken::new();
+        let reporter_changed = Arc::new(Notify::new());
         let mut reporter_task: Option<JoinHandle<()>> = None;
         let mut reporter_started = false;
         print_current_url(&cf_hostname, config.target_port, &access_uuid).await?;
 
         loop {
+            // 触发条件: -const 要在本次进程运行期间保持域名和访问码。
+            // 不能让旧定时器继续就绪: 否则仍会轮换 UUID 或重建隧道。
+            // 防止副作用: 两处轮换分支在常量模式下都不执行。
             tokio::select! {
                 biased;
-                _ = &mut uuid_rotation => {
+                _ = &mut uuid_rotation, if !config.constant_url => {
                     // 触发条件: UUID 轮换与新请求可能在同一轮就绪。
                     // 不能使用随机分支顺序: 边界请求可能继续取得旧 UUID。
                     // 防止副作用: 优先轮换让新请求只快照新 UUID。
                     *access_uuid.write().await = AccessUuid::generate();
                     uuid_rotation.as_mut().reset(time::Instant::now() + UUID_LIFETIME);
                     print_current_url(&cf_hostname, config.target_port, &access_uuid).await?;
+                    if reporter_task.is_some() {
+                        reporter_changed.notify_one();
+                    }
                 }
                 event = events.recv() => match event {
                     Ok(SessionEvent::Connected { transport, location }) => {
                         println!("ready via {transport:?} at {location}");
                         if !reporter_started {
-                            if let Some(center) = config.discover_host {
-                                let reporter = Reporter::new(
-                                    center,
-                                    config.key.clone(),
-                                    cf_hostname.clone(),
-                                    config.target_ip,
-                                    access_uuid.clone(),
-                                )?;
+                            if let Some(backend) = &reporter_backend {
+                                let reporter = match backend {
+                                    ActiveReporter::CustomCenter(center) => Reporter::new_center(
+                                        *center,
+                                        config.key.clone(),
+                                        cf_hostname.clone(),
+                                        config.target_ip,
+                                        access_uuid.clone(),
+                                    )?,
+                                    ActiveReporter::CfKv(kv) => Reporter::new_kv(
+                                        kv.clone(),
+                                        reporter_changed.clone(),
+                                        config.key.clone(),
+                                        cf_hostname.clone(),
+                                        config.target_ip,
+                                        access_uuid.clone(),
+                                    )?,
+                                };
                                 let shutdown = reporter_shutdown.clone();
                                 reporter_task = Some(tokio::spawn(async move {
                                     reporter.run(shutdown).await
@@ -184,13 +245,13 @@ pub(crate) async fn run(config: Config) -> Result<(), String> {
                             request,
                             target,
                             expected_uuid,
-                            Some(activity),
+                            activity,
                         ).await {
                             eprintln!("{error}");
                         }
                     });
                 }
-                _ = &mut idle_refresh => {
+                _ = &mut idle_refresh, if !config.constant_url => {
                     println!("tunnel idle for six hours, refreshing URL");
                     stop_reporter(&reporter_shutdown, &mut reporter_task).await?;
                     session
@@ -269,5 +330,5 @@ fn parse_port(raw: &str, name: &str) -> Result<u16, String> {
 ///
 /// Example: missing `-key` -> this usage string.
 fn daemon_usage() -> String {
-    "usage: tmp-proxy -daemon -key <key> -ip <target_ip> [-port <target_port>] [-discover-host <ip:port>]".to_string()
+    "usage: tmp-proxy -daemon -key <key> -ip <target_ip> [-port <target_port>] [-discover-host <ip:port>] [-const]".to_string()
 }

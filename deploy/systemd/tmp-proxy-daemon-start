@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Source the existing shell-style environment file before applying strict mode.
+# Example: export CF_TOKEN="abc" in .dev.env -> daemon receives CF_TOKEN=abc.
+source /etc/cfp/env
+set -euo pipefail
+
+if [[ -z "${CF_TOKEN:-}" ]]; then
+    echo 'CF_TOKEN is missing from /etc/cfp/env' >&2
+    exit 1
+fi
+exec /usr/local/bin/tmp-proxy -daemon -key demo -ip 127.0.0.1 -port 22 -const
