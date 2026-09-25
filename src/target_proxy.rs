@@ -92,10 +92,10 @@ pub(crate) fn build_wss_url(
 pub(crate) async fn handle_request(
     request: IncomingRequest,
     target: Target,
-    expected_uuid: String,
+    expected_uuids: Vec<String>,
     activity: Option<ConnectionActivity>,
 ) -> Result<(), String> {
-    let Some(request_url) = matching_request_url(&request, &expected_uuid) else {
+    let Some(request_url) = matching_request_url(&request, &expected_uuids) else {
         reject_request(request, 403).await?;
         return Ok(());
     };
@@ -202,14 +202,14 @@ async fn reject_request(request: IncomingRequest, status: u16) -> Result<(), Str
         .map_err(|error| format!("respond rejection failed: {error}"))
 }
 
-/// Finds URL-bearing Cloudflare metadata containing the expected UUID.
+/// Finds URL-bearing Cloudflare metadata containing any accepted UUID.
 ///
-/// Example: matching destination returns that destination for port parsing.
-fn matching_request_url<'a>(request: &'a IncomingRequest, expected: &str) -> Option<&'a str> {
+/// Example: destination carrying current or previous UUID returns that destination.
+fn matching_request_url<'a>(request: &'a IncomingRequest, expected: &[String]) -> Option<&'a str> {
     // 触发条件: Cloudflare metadata 字段随入口协议变化。
     // 不能直接依赖单字段: QUIC 与 HTTP/2 提供的字段不同。
     // 防止副作用: 避免字段名差异导致正确 URL 被误拒。
-    if extract_uuid(&request.destination).as_deref() == Some(expected) {
+    if request_url_matches(&request.destination, expected) {
         return Some(&request.destination);
     }
     request
@@ -219,8 +219,18 @@ fn matching_request_url<'a>(request: &'a IncomingRequest, expected: &str) -> Opt
             let key = key.to_ascii_lowercase();
             key.contains("path") || key.contains("uri") || key.contains("url")
         })
-        .find(|(_, value)| extract_uuid(value).as_deref() == Some(expected))
+        .find(|(_, value)| request_url_matches(value, expected))
         .map(|(_, value)| value.as_str())
+}
+
+/// Checks whether one request URL carries any UUID from an acceptance snapshot.
+///
+/// Example: URL code `old` plus `[new, old]` -> true.
+fn request_url_matches(raw: &str, expected: &[String]) -> bool {
+    let Some(received) = extract_uuid(raw) else {
+        return false;
+    };
+    expected.iter().any(|candidate| candidate == &received)
 }
 
 /// Computes the RFC 6455 WebSocket accept value for a Cloudflare request.

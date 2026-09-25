@@ -32,7 +32,7 @@ pub(crate) struct Config {
     pub(crate) target_port: u16,
     /// Optional validated discovery backend, with CLI center precedence.
     pub(crate) reporter: Option<BackendConfig>,
-    /// Keep the access UUID and Quick Tunnel hostname for this process lifetime.
+    /// Keep the Quick Tunnel hostname while access UUIDs continue rotating.
     pub(crate) constant_url: bool,
 }
 
@@ -161,16 +161,16 @@ pub(crate) async fn run(config: Config) -> Result<(), String> {
         print_current_url(&cf_hostname, config.target_port, &access_uuid).await?;
 
         loop {
-            // 触发条件: -const 要在本次进程运行期间保持域名和访问码。
-            // 不能让旧定时器继续就绪: 否则仍会轮换 UUID 或重建隧道。
-            // 防止副作用: 两处轮换分支在常量模式下都不执行。
+            // 触发条件: -const 只固定 hostname，UUID 仍须每 24 小时轮换。
+            // 不能停用 UUID 定时器: KV 客户端依赖定期取得新访问码。
+            // 防止副作用: 仅禁用空闲重建，避免 hostname 被替换。
             tokio::select! {
                 biased;
-                _ = &mut uuid_rotation, if !config.constant_url => {
+                _ = &mut uuid_rotation => {
                     // 触发条件: UUID 轮换与新请求可能在同一轮就绪。
                     // 不能使用随机分支顺序: 边界请求可能继续取得旧 UUID。
-                    // 防止副作用: 优先轮换让新请求只快照新 UUID。
-                    *access_uuid.write().await = AccessUuid::generate();
+                    // 防止副作用: -const 保留上一枚 UUID，其他模式立即淘汰。
+                    access_uuid.write().await.rotate(config.constant_url);
                     uuid_rotation.as_mut().reset(time::Instant::now() + UUID_LIFETIME);
                     print_current_url(&cf_hostname, config.target_port, &access_uuid).await?;
                     if reporter_task.is_some() {
@@ -234,7 +234,7 @@ pub(crate) async fn run(config: Config) -> Result<(), String> {
                     // 触发条件: 请求接入后可能立刻发生下一轮 UUID 轮换。
                     // 不能在异步处理器中再次读取共享 UUID: 调度延迟会改变判定时点。
                     // 防止副作用: 接入时快照保证轮换不影响已接入及已建立的连接。
-                    let expected_uuid = access_uuid.read().await.value().to_string();
+                    let expected_uuids = access_uuid.read().await.accepted_values();
                     let target = target_proxy::Target::with_port_override(
                         config.target_ip,
                         config.target_port,
@@ -244,7 +244,7 @@ pub(crate) async fn run(config: Config) -> Result<(), String> {
                         if let Err(error) = target_proxy::handle_request(
                             request,
                             target,
-                            expected_uuid,
+                            expected_uuids,
                             activity,
                         ).await {
                             eprintln!("{error}");

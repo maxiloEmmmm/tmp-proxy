@@ -7,6 +7,8 @@ use uuid::{Uuid, Version};
 pub(crate) struct AccessUuid {
     /// UUID accepted by new Cloudflare requests.
     value: String,
+    /// Immediately preceding UUID retained only by constant-URL daemon mode.
+    previous_value: Option<String>,
     /// Monotonic creation instant used to report UUID age.
     created_at: Instant,
 }
@@ -18,8 +20,23 @@ impl AccessUuid {
     pub(crate) fn generate() -> Self {
         Self {
             value: Uuid::new_v4().to_string(),
+            previous_value: None,
             created_at: Instant::now(),
         }
+    }
+
+    /// Replaces the current UUID and optionally keeps it for one grace period.
+    ///
+    /// Example: constant URL rotation keeps `old` beside newly generated `current`.
+    pub(crate) fn rotate(&mut self, keep_previous: bool) {
+        let next = Uuid::new_v4().to_string();
+        if keep_previous {
+            self.previous_value = Some(std::mem::replace(&mut self.value, next));
+        } else {
+            self.value = next;
+            self.previous_value = None;
+        }
+        self.created_at = Instant::now();
     }
 
     /// Returns the UUID currently accepted by new connections.
@@ -27,6 +44,18 @@ impl AccessUuid {
     /// Example: newly generated state -> one canonical UUID v4 string.
     pub(crate) fn value(&self) -> &str {
         &self.value
+    }
+
+    /// Returns owned UUIDs accepted by the next request snapshot.
+    ///
+    /// Example: constant mode after rotation -> `[current, previous]`.
+    pub(crate) fn accepted_values(&self) -> Vec<String> {
+        let mut values = Vec::with_capacity(1 + usize::from(self.previous_value.is_some()));
+        values.push(self.value.clone());
+        if let Some(previous) = &self.previous_value {
+            values.push(previous.clone());
+        }
+        values
     }
 
     /// Returns an owned UUID and its whole-second age for reporting.
