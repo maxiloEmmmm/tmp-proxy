@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Atomically install the x86_64 daemon binary with readiness rollback.
+# Atomically install a native Linux daemon binary with readiness rollback.
 # Example: install-daemon-root.sh /tmp/tmp-proxy.new -> ready daemon or rollback.
 set -euo pipefail
 
