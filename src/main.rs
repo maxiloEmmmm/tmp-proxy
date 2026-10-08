@@ -42,6 +42,8 @@ use url::Url;
 
 const DEFAULT_YY_LISTEN: &str = "0.0.0.0:0";
 const DEFAULT_NAS_SSH_PORT: &str = "22";
+/// Interval between yy-originated WebSocket heartbeat frames.
+const WEBSOCKET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// CLI mode selected from process arguments.
 ///
@@ -712,57 +714,69 @@ async fn run_cf_tunnel(
     cancel: CancellationToken,
 ) -> Result<(), String> {
     send_status(&sender, "creating trycloudflare tunnel".to_string());
-    let quick_tunnel = cf_lib::create_quick_tunnel()
-        .await
-        .map_err(|err| format!("create tunnel failed: {err}"))?;
-    let wss_url = target_proxy::build_wss_url(&quick_tunnel.hostname, &pairing_uuid, None)?;
-    let session = quick_tunnel.session;
-    let mut events = session.events();
-    let zz_command = build_default_zz_command(&wss_url, &username);
-    let mut ready_sent = false;
     loop {
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                session.shutdown().await
-                    .map_err(|error| format!("shutdown tunnel failed: {error}"))?;
-                return Ok(());
-            }
-            event = events.recv() => match event {
-                Ok(SessionEvent::Connected { transport, location }) => {
-                    if !ready_sent {
-                        let _ = sender.send(GuiEvent::Ready {
-                            wss_url: wss_url.clone(),
-                            pairing_uuid: pairing_uuid.clone(),
-                            zz_command: zz_command.clone(),
-                        });
-                        ready_sent = true;
-                    }
-                    send_status(&sender, format!("ready via {transport:?} at {location}"));
+        let quick_tunnel = cf_lib::create_quick_tunnel()
+            .await
+            .map_err(|err| format!("create tunnel failed: {err}"))?;
+        let wss_url = target_proxy::build_wss_url(&quick_tunnel.hostname, &pairing_uuid, None)?;
+        let session = quick_tunnel.session;
+        let mut events = session.events();
+        let zz_command = build_default_zz_command(&wss_url, &username);
+        let mut ready_sent = false;
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    session.shutdown().await
+                        .map_err(|error| format!("shutdown tunnel failed: {error}"))?;
+                    return Ok(());
                 }
-                Ok(SessionEvent::Reconnecting { delay, reason }) => send_status(
-                    &sender,
-                    format!("connection lost ({reason}), retrying in {}ms", delay.as_millis()),
-                ),
-                Ok(SessionEvent::Stopped) => return Ok(()),
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    return Err("tunnel event channel closed".to_string());
-                }
-            },
-            request = session.accept() => {
-                let request = request.map_err(|error| format!("accept tunnel request failed: {error}"))?;
-                let target = target_proxy::Target::fixed(target.clone());
-                let pairing_uuid = pairing_uuid.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = target_proxy::handle_request(
-                        request,
-                        target,
-                        vec![pairing_uuid],
-                        None,
-                    ).await {
-                        eprintln!("{error}");
+                event = events.recv() => match event {
+                    Ok(SessionEvent::Connected { transport, location }) => {
+                        if !ready_sent {
+                            let _ = sender.send(GuiEvent::Ready {
+                                wss_url: wss_url.clone(),
+                                pairing_uuid: pairing_uuid.clone(),
+                                zz_command: zz_command.clone(),
+                            });
+                            ready_sent = true;
+                        }
+                        send_status(&sender, format!("ready via {transport:?} at {location}"));
                     }
-                });
+                    Ok(SessionEvent::Reconnecting { delay, reason }) => send_status(
+                        &sender,
+                        format!("connection lost ({reason}), retrying in {}ms", delay.as_millis()),
+                    ),
+                    Ok(SessionEvent::Unauthorized { reason }) => {
+                        // 触发条件: Cloudflare 已拒绝当前 GUI tunnel 凭据。
+                        // 不能停留在旧 URL: 后续重连不会恢复已失效的 hostname。
+                        // 防止副作用: 新 tunnel 就绪后重新发送完整的连接信息。
+                        send_status(
+                            &sender,
+                            format!("tunnel credentials rejected ({reason}), creating a new tunnel"),
+                        );
+                        break;
+                    }
+                    Ok(SessionEvent::Stopped) => return Ok(()),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err("tunnel event channel closed".to_string());
+                    }
+                },
+                request = session.accept() => {
+                    let request = request.map_err(|error| format!("accept tunnel request failed: {error}"))?;
+                    let target = target_proxy::Target::fixed(target.clone());
+                    let pairing_uuid = pairing_uuid.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = target_proxy::handle_request(
+                            request,
+                            target,
+                            vec![pairing_uuid],
+                            None,
+                        ).await {
+                            eprintln!("{error}");
+                        }
+                    });
+                }
             }
         }
     }
@@ -805,9 +819,9 @@ async fn run_yy(config: YyConfig) -> Result<(), String> {
             .accept()
             .await
             .map_err(|err| format!("accept failed: {err}"))?;
-        let wss_url = endpoint.current();
+        let mut endpoint = endpoint.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_yy_tcp_connection(stream, &wss_url).await {
+            if let Err(err) = handle_yy_tcp_connection(stream, &mut endpoint).await {
                 eprintln!("{peer}: {err}");
             }
         });
@@ -889,9 +903,9 @@ async fn run_zz_accept_loop(
             _ = cancel.cancelled() => return Ok(()),
             accepted = listener.accept() => {
                 let (stream, peer) = accepted.map_err(|err| format!("accept failed: {err}"))?;
-                let wss_url = endpoint.current();
+                let mut endpoint = endpoint.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle_yy_tcp_connection(stream, &wss_url).await {
+                    if let Err(err) = handle_yy_tcp_connection(stream, &mut endpoint).await {
                         eprintln!("{peer}: {err}");
                     }
                 });
@@ -919,13 +933,24 @@ fn validate_yy_url(wss_url: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Handles one local yy TCP connection by dialing the remote WebSocket URL.
+/// Handles one local yy TCP connection and retries once after a changed KV endpoint.
 ///
-/// Example: local SSH connection becomes one `wss://.../tcp?code=<uuid>` connection.
-async fn handle_yy_tcp_connection(stream: TcpStream, wss_url: &str) -> Result<(), String> {
-    let (ws, _) = connect_async(wss_url)
-        .await
-        .map_err(|err| format!("connect websocket failed: {err}"))?;
+/// Example: an expired hostname refreshes KV, then the same SSH socket uses the new URL.
+async fn handle_yy_tcp_connection(
+    stream: TcpStream,
+    endpoint: &mut endpoint::Source,
+) -> Result<(), String> {
+    let wss_url = endpoint.current();
+    let first_error = match connect_async(&wss_url).await {
+        Ok((ws, _)) => return bridge_tcp_tokio_ws(stream, ws).await,
+        Err(error) => error,
+    };
+    let Some(refreshed) = endpoint.refresh_after_failure(&wss_url).await else {
+        return Err(format!("connect websocket failed: {first_error}"));
+    };
+    let (ws, _) = connect_async(&refreshed).await.map_err(|error| {
+        format!("connect refreshed websocket failed: {error}; initial error: {first_error}")
+    })?;
     bridge_tcp_tokio_ws(stream, ws).await
 }
 
@@ -944,19 +969,32 @@ where
 
     let tcp_to_ws = async {
         let mut buffer = vec![0_u8; 16 * 1024];
+        let first_heartbeat = time::Instant::now() + WEBSOCKET_HEARTBEAT_INTERVAL;
+        let mut heartbeat = time::interval_at(first_heartbeat, WEBSOCKET_HEARTBEAT_INTERVAL);
+        heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
         loop {
-            let len = tcp_reader
-                .read(&mut buffer)
-                .await
-                .map_err(|err| format!("read tcp failed: {err}"))?;
-            if len == 0 {
-                let _ = ws_writer.close().await;
-                return Ok::<(), String>(());
+            tokio::select! {
+                read = tcp_reader.read(&mut buffer) => {
+                    let len = read.map_err(|err| format!("read tcp failed: {err}"))?;
+                    if len == 0 {
+                        let _ = ws_writer.close().await;
+                        return Ok::<(), String>(());
+                    }
+                    ws_writer
+                        .send(TokioMessage::Binary(Bytes::copy_from_slice(&buffer[..len])))
+                        .await
+                        .map_err(|err| format!("write websocket failed: {err}"))?;
+                }
+                _ = heartbeat.tick() => {
+                    // 触发条件：SSH 空闲时可能长期没有 TCP 业务数据。
+                    // 常规路径不够：tungstenite 只自动回复，不主动发送 Ping。
+                    // 防止回归：周期心跳避免公网 WSS 被空闲超时清理。
+                    ws_writer
+                        .send(TokioMessage::Ping(Bytes::new()))
+                        .await
+                        .map_err(|err| format!("write websocket heartbeat failed: {err}"))?;
+                }
             }
-            ws_writer
-                .send(TokioMessage::Binary(Bytes::copy_from_slice(&buffer[..len])))
-                .await
-                .map_err(|err| format!("write websocket failed: {err}"))?;
         }
     };
 

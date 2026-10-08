@@ -270,9 +270,15 @@ fn parse_registration(
                 .as_ref()
                 .and_then(|text| text.to_str().ok())
                 .unwrap_or("registration rejected");
-            Err(CfError::new(format!(
-                "Cloudflare registration failed: {cause}"
-            )))
+            let message = format!("Cloudflare registration failed: {cause}");
+            if cause.to_ascii_lowercase().contains("unauthorized") {
+                // 触发条件: Cloudflare 明确拒绝当前 tunnel 凭据。
+                // 不能继续普通重连: 同一 ID 和 secret 不会重新变为有效。
+                // 防止副作用: 保留错误类别，让 daemon 重新申请 Quick Tunnel。
+                Err(CfError::unauthorized(message))
+            } else {
+                Err(CfError::new(message))
+            }
         }
     }
 }

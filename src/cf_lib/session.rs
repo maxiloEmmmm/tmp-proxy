@@ -160,6 +160,9 @@ async fn supervise(
                         attempts = attempts.saturating_add(1);
                     }
                     Err(error) => {
+                        if emit_unauthorized(&events, &error) {
+                            return;
+                        }
                         attempts = attempts.saturating_add(1);
                         if !wait_before_retry(&events, &shutdown, &mut backoff, error.to_string())
                             .await
@@ -170,6 +173,9 @@ async fn supervise(
                 }
             }
             Err(error) => {
+                if emit_unauthorized(&events, &error) {
+                    return;
+                }
                 attempts = attempts.saturating_add(1);
                 if !wait_before_retry(&events, &shutdown, &mut backoff, error.to_string()).await {
                     break;
@@ -200,6 +206,7 @@ async fn connect_round(
         };
         match result {
             Ok(transport) => return Ok(ActiveTransport::Quic(transport)),
+            Err(error) if error.is_unauthorized() => return Err(error),
             Err(error) => failures.push(format!("QUIC {}: {error}", edge.socket)),
         }
         let result = tokio::select! {
@@ -208,6 +215,7 @@ async fn connect_round(
         };
         match result {
             Ok(transport) => return Ok(ActiveTransport::Http2(transport)),
+            Err(error) if error.is_unauthorized() => return Err(error),
             Err(error) => failures.push(format!("HTTP/2 {}: {error}", edge.socket)),
         }
     }
@@ -215,6 +223,19 @@ async fn connect_round(
         "all Cloudflare edge connections failed: {}",
         failures.join("; ")
     )))
+}
+
+/// Emits a terminal session event when Cloudflare rejects tunnel credentials.
+///
+/// Example: an unauthorized registration error -> event emitted and `true`.
+fn emit_unauthorized(events: &broadcast::Sender<SessionEvent>, error: &CfError) -> bool {
+    if !error.is_unauthorized() {
+        return false;
+    }
+    let _ = events.send(SessionEvent::Unauthorized {
+        reason: error.to_string(),
+    });
+    true
 }
 
 /// Emits reconnect state and waits for the current exponential delay.

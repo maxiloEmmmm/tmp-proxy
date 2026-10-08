@@ -18,6 +18,19 @@ use crate::cf_lib::transport::PendingResponse;
 pub struct CfError {
     /// Human-readable error including the failed operation.
     message: String,
+    /// Machine-readable category used by reconnect policy.
+    kind: CfErrorKind,
+}
+
+/// Recovery category attached to one Cloudflare client error.
+///
+/// Example: a registration `Unauthorized` response -> `Unauthorized`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CfErrorKind {
+    /// Error that may recover while retaining the current tunnel credentials.
+    Other,
+    /// Cloudflare rejected the current tunnel credentials as unauthorized.
+    Unauthorized,
 }
 
 impl CfError {
@@ -27,7 +40,25 @@ impl CfError {
     pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            kind: CfErrorKind::Other,
         }
+    }
+
+    /// Creates an error for credentials rejected by Cloudflare registration.
+    ///
+    /// Example: `Unauthorized: Tunnel not found` -> replacement tunnel required.
+    pub(crate) fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: CfErrorKind::Unauthorized,
+        }
+    }
+
+    /// Reports whether reconnecting with the same credentials cannot recover.
+    ///
+    /// Example: an unauthorized registration error -> `true`.
+    pub(crate) fn is_unauthorized(&self) -> bool {
+        self.kind == CfErrorKind::Unauthorized
     }
 }
 
@@ -92,6 +123,11 @@ pub enum SessionEvent {
         /// Delay before the next connection round.
         delay: std::time::Duration,
         /// Last connection error.
+        reason: String,
+    },
+    /// Cloudflare rejected the current tunnel credentials.
+    Unauthorized {
+        /// Registration rejection returned by the Cloudflare edge.
         reason: String,
     },
     /// Session completed a graceful shutdown.

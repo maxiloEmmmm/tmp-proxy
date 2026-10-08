@@ -1,7 +1,7 @@
 //! Resolves direct or KV-backed WSS endpoints for yy and zz consumers.
 
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::time;
 use url::Url;
 
@@ -57,6 +57,8 @@ impl Consumer {
 pub(crate) struct Source {
     /// Watch receiver retaining and exposing the newest endpoint string.
     current: watch::Receiver<String>,
+    /// Failure refresh signal, absent for direct URL endpoints.
+    refresh_requests: Option<mpsc::Sender<()>>,
 }
 
 impl Source {
@@ -67,7 +69,10 @@ impl Source {
         match spec {
             Spec::Url(wss_url) => {
                 let (_, current) = watch::channel(wss_url);
-                Ok(Self { current })
+                Ok(Self {
+                    current,
+                    refresh_requests: None,
+                })
             }
             Spec::Kv { key, query } => Self::start_kv(key, query, consumer).await,
         }
@@ -78,6 +83,22 @@ impl Source {
     /// Example: a connection accepted after refresh receives the new code.
     pub(crate) fn current(&self) -> String {
         self.current.borrow().clone()
+    }
+
+    /// Requests one coalesced KV refresh after a WSS dial failure.
+    ///
+    /// Example: an expired Quick Tunnel hostname -> return the new KV URL;
+    /// an unchanged or direct URL -> `None`.
+    pub(crate) async fn refresh_after_failure(&mut self, failed: &str) -> Option<String> {
+        let refresh_requests = self.refresh_requests.as_ref()?;
+        let current = self.current.borrow_and_update().clone();
+        if current != failed {
+            return Some(current);
+        }
+        let _ = refresh_requests.try_send(());
+        self.current.changed().await.ok()?;
+        let refreshed = self.current.borrow_and_update().clone();
+        (refreshed != failed).then_some(refreshed)
     }
 
     /// Creates one refreshing KV source after validating local configuration.
@@ -98,26 +119,66 @@ impl Source {
         let initial = read_until_success(&reader, &key, query.as_deref(), consumer).await;
         println!("{} KV endpoint loaded for {key}", consumer.label());
         let (updates, current) = watch::channel(initial);
-        tokio::spawn(refresh_loop(reader, key, query, consumer, updates));
-        Ok(Self { current })
+        let (refresh_requests, requested_refreshes) = mpsc::channel(1);
+        tokio::spawn(refresh_loop(
+            reader,
+            key,
+            query,
+            consumer,
+            updates,
+            requested_refreshes,
+        ));
+        Ok(Self {
+            current,
+            refresh_requests: Some(refresh_requests),
+        })
     }
 }
 
-/// Refreshes twelve hours after success and retries failures every ten seconds.
+/// Refreshes on schedule or WSS failure and retries KV failures every ten seconds.
 ///
-/// Example: three failed reads preserve the old endpoint until the fourth succeeds.
+/// Example: an expired hostname triggers an immediate KV read and wakes all waiters.
 async fn refresh_loop(
     reader: KvReader,
     key: String,
     query: Option<String>,
     consumer: Consumer,
     updates: watch::Sender<String>,
+    mut requested_refreshes: mpsc::Receiver<()>,
 ) {
+    let mut last_forced_refresh: Option<time::Instant> = None;
     loop {
-        time::sleep(KV_REFRESH_INTERVAL).await;
+        let forced = tokio::select! {
+            _ = time::sleep(KV_REFRESH_INTERVAL) => false,
+            request = requested_refreshes.recv() => {
+                if request.is_none() {
+                    return;
+                }
+                true
+            }
+        };
+        if forced {
+            // 触发条件：失效 endpoint 会让多个本地连接同时请求刷新。
+            // 不能逐连接读取 KV：浏览器或 SSH 重试会放大 API 请求。
+            // 防止副作用：强制刷新至少间隔十秒，容量一的 channel 合并并发请求。
+            if let Some(last_refresh) = last_forced_refresh {
+                let next_refresh = last_refresh + KV_RETRY_INTERVAL;
+                if next_refresh > time::Instant::now() {
+                    time::sleep_until(next_refresh).await;
+                }
+            }
+        }
         let endpoint = read_until_success(&reader, &key, query.as_deref(), consumer).await;
         updates.send_replace(endpoint);
-        println!("{} KV endpoint refreshed for {key}", consumer.label());
+        if forced {
+            last_forced_refresh = Some(time::Instant::now());
+            println!(
+                "{} KV endpoint refreshed after connection failure for {key}",
+                consumer.label()
+            );
+        } else {
+            println!("{} KV endpoint refreshed for {key}", consumer.label());
+        }
     }
 }
 

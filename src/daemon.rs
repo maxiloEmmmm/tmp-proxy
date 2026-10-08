@@ -213,6 +213,16 @@ pub(crate) async fn run(config: Config) -> Result<(), String> {
                             delay.as_millis()
                         );
                     }
+                    Ok(SessionEvent::Unauthorized { reason }) => {
+                        // 触发条件: Cloudflare 已拒绝当前 Quick Tunnel 凭据。
+                        // 不能继续当前 session: 重连仍会提交相同的失效凭据。
+                        // 防止副作用: 先停止旧上报，避免它覆盖下一代 KV endpoint。
+                        eprintln!(
+                            "tunnel credentials rejected ({reason}), creating a new Quick Tunnel"
+                        );
+                        stop_reporter(&reporter_shutdown, &mut reporter_task).await?;
+                        break;
+                    }
                     Ok(SessionEvent::Stopped) => {
                         stop_reporter(&reporter_shutdown, &mut reporter_task).await?;
                         return Ok(());
