@@ -1,3 +1,4 @@
+use hickory_resolver::Resolver;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +20,9 @@ const DEFAULT_TARGET_PORT: u16 = 22;
 const TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const UUID_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 const CF_IDLE_LIFETIME: Duration = Duration::from_secs(6 * 60 * 60);
+const HOSTNAME_HEALTH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const HOSTNAME_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
+const HOSTNAME_HEALTH_FAILURE_LIMIT: u8 = 3;
 
 /// CLI configuration for non-GUI daemon mode.
 ///
@@ -158,6 +162,10 @@ pub(crate) async fn run(config: Config) -> Result<(), String> {
         let reporter_changed = Arc::new(Notify::new());
         let mut reporter_task: Option<JoinHandle<()>> = None;
         let mut reporter_started = false;
+        let first_hostname_check = time::Instant::now() + HOSTNAME_HEALTH_INTERVAL;
+        let mut hostname_health = time::interval_at(first_hostname_check, HOSTNAME_HEALTH_INTERVAL);
+        hostname_health.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        let mut hostname_health_failures = 0_u8;
         print_current_url(&cf_hostname, config.target_port, &access_uuid).await?;
 
         loop {
@@ -233,6 +241,40 @@ pub(crate) async fn run(config: Config) -> Result<(), String> {
                         return Err("tunnel event channel closed".to_string());
                     }
                 },
+                _ = hostname_health.tick() => {
+                    match resolve_tunnel_hostname(&cf_hostname).await {
+                        Ok(()) => {
+                            if hostname_health_failures > 0 {
+                                println!(
+                                    "tunnel hostname resolved after {hostname_health_failures} failed checks"
+                                );
+                            }
+                            hostname_health_failures = 0;
+                        }
+                        Err(error) => {
+                            hostname_health_failures = hostname_health_failures.saturating_add(1);
+                            eprintln!(
+                                "tunnel hostname check failed ({hostname_health_failures}/{HOSTNAME_HEALTH_FAILURE_LIMIT}): {error}"
+                            );
+                            if hostname_health_failures >= HOSTNAME_HEALTH_FAILURE_LIMIT {
+                                // 触发条件: edge socket 存活，但公网 hostname 连续无法解析。
+                                // 不能等待连接错误: Cloudflare 可能只删除 DNS，保留 edge 连接。
+                                // 防止副作用: 先停旧上报，避免失效 hostname 覆盖新 KV。
+                                eprintln!(
+                                    "tunnel hostname remained unavailable, creating a new Quick Tunnel"
+                                );
+                                stop_reporter(&reporter_shutdown, &mut reporter_task).await?;
+                                session
+                                    .shutdown()
+                                    .await
+                                    .map_err(|error| format!(
+                                        "shutdown unhealthy tunnel failed: {error}"
+                                    ))?;
+                                break;
+                            }
+                        }
+                    }
+                }
                 request = session.accept() => {
                     let request = match request {
                         Ok(request) => request,
@@ -275,6 +317,26 @@ pub(crate) async fn run(config: Config) -> Result<(), String> {
             }
         }
     }
+}
+
+/// Resolves one public Quick Tunnel hostname within a bounded DNS query.
+///
+/// Example: an NXDOMAIN response for an expired hostname -> error.
+async fn resolve_tunnel_hostname(hostname: &str) -> Result<(), String> {
+    let resolver = Resolver::builder_tokio()
+        .map_err(|error| format!("load system DNS configuration failed: {error}"))?
+        .build();
+    let addresses = time::timeout(
+        HOSTNAME_HEALTH_TIMEOUT,
+        resolver.lookup_ip(hostname.to_string()),
+    )
+    .await
+    .map_err(|_| format!("resolve {hostname} timed out"))?
+    .map_err(|error| format!("resolve {hostname} failed: {error}"))?;
+    if addresses.iter().next().is_none() {
+        return Err(format!("resolve {hostname} returned no addresses"));
+    }
+    Ok(())
 }
 
 /// Cancels and joins the reporter before an epoch can publish a replacement URL.
