@@ -44,7 +44,7 @@ pub(crate) struct Config {
 enum ActiveReporter {
     /// Existing center socket address.
     CustomCenter(SocketAddr),
-    /// KV backend whose resolved namespace survives tunnel refreshes.
+    /// KV backend whose namespace cache survives tunnel refreshes.
     CfKv(Arc<KvBackend>),
 }
 
@@ -126,12 +126,6 @@ pub(crate) async fn run(config: Config) -> Result<(), String> {
         Some(BackendConfig::CustomCenter(center)) => Some(ActiveReporter::CustomCenter(center)),
         Some(BackendConfig::CfKv(kv_config)) => {
             let kv = Arc::new(KvBackend::new(kv_config, &config.key)?);
-            if let Err(error) = kv.prepare().await {
-                // 触发条件: 启动时 Cloudflare namespace 暂时无法解析。
-                // 不能让 daemon 退出或立刻重试: 上报失败只记日志，等下一次正常上报。
-                // 防止副作用: discovery 故障不影响 tunnel 启动。
-                eprintln!("discovery report failed: {error}");
-            }
             Some(ActiveReporter::CfKv(kv))
         }
         None => None,

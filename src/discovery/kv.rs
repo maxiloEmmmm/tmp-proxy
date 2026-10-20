@@ -1,7 +1,9 @@
 //! Cloudflare Workers KV REST API backend for discovery reports.
 
+use http::StatusCode;
 use reqwest::{Client, Url};
 use serde::Deserialize;
+use std::fmt;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
@@ -13,6 +15,47 @@ const API_BASE: &str = "https://api.cloudflare.com/client/v4";
 const EXPIRATION_TTL_SECONDS: u64 = 3 * 60 * 60;
 const API_TIMEOUT: Duration = Duration::from_secs(10);
 const NAMESPACES_PER_PAGE: usize = 1000;
+
+/// Classified failure from one Cloudflare KV report attempt.
+///
+/// Example: a request timeout is retryable; an HTTP 401 is permanent.
+pub(crate) enum KvWriteError {
+    /// A transport, rate-limit, or server failure that may recover by itself.
+    Retryable(String),
+    /// A configuration or client failure that needs operator intervention.
+    Permanent(String),
+}
+
+impl KvWriteError {
+    /// Classifies one Cloudflare HTTP failure by its response status.
+    ///
+    /// Example: HTTP 429 -> retryable; HTTP 403 -> permanent.
+    fn from_status(status: StatusCode, message: String) -> Self {
+        if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+            Self::Retryable(message)
+        } else {
+            Self::Permanent(message)
+        }
+    }
+
+    /// Reports whether the same operation should run again after a delay.
+    ///
+    /// Example: a network timeout -> true; an invalid token -> false.
+    pub(crate) fn should_retry(&self) -> bool {
+        matches!(self, Self::Retryable(_))
+    }
+}
+
+impl fmt::Display for KvWriteError {
+    /// Formats the original error without exposing retry classification internals.
+    ///
+    /// Example: retryable `timeout` -> `timeout`.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Retryable(message) | Self::Permanent(message) => formatter.write_str(message),
+        }
+    }
+}
 
 /// Prepared KV client that caches the resolved namespace ID for the daemon lifetime.
 pub(crate) struct KvBackend {
@@ -83,31 +126,17 @@ impl KvBackend {
         })
     }
 
-    /// Resolves a namespace title at startup, keeping a successful ID cached.
-    ///
-    /// Example: title `proxy` -> its 32-character namespace ID.
-    pub(crate) async fn prepare(&self) -> Result<(), String> {
-        self.resolve_namespace().await.map(|_| ())
-    }
-
-    /// Indicates whether startup has already resolved the namespace.
-    ///
-    /// Example: failed title lookup -> false until a later normal report succeeds.
-    pub(crate) async fn is_ready(&self) -> bool {
-        self.namespace_id.read().await.is_some()
-    }
-
     /// Writes one report with a fixed three-hour expiration.
     ///
     /// Example: a new UUID -> PUT latest `Report` to `cfp/nas`.
-    pub(crate) async fn write(&self, report: &Report) -> Result<(), String> {
+    pub(crate) async fn write(&self, report: &Report) -> Result<(), KvWriteError> {
         let namespace_id = self.resolve_namespace().await?;
-        let mut url =
-            Url::parse(API_BASE).map_err(|error| format!("invalid CF API URL: {error}"))?;
+        let mut url = Url::parse(API_BASE)
+            .map_err(|error| KvWriteError::Permanent(format!("invalid CF API URL: {error}")))?;
         {
-            let mut segments = url
-                .path_segments_mut()
-                .map_err(|_| "CF API URL cannot contain path segments".to_string())?;
+            let mut segments = url.path_segments_mut().map_err(|_| {
+                KvWriteError::Permanent("CF API URL cannot contain path segments".to_string())
+            })?;
             segments.extend(["accounts", ACCOUNT_ID, "storage", "kv", "namespaces"]);
             segments.push(&namespace_id);
             segments.push("values");
@@ -127,16 +156,23 @@ impl KvBackend {
             .json(report)
             .send()
             .await
-            .map_err(|error| format!("Cloudflare KV write request failed: {error}"))?;
+            .map_err(|error| {
+                KvWriteError::Retryable(format!("Cloudflare KV write request failed: {error}"))
+            })?;
         let status = response.status();
-        let body: ApiResponse<serde::de::IgnoredAny> = response
-            .json()
-            .await
-            .map_err(|error| format!("Cloudflare KV write returned {status}: {error}"))?;
+        let body: ApiResponse<serde::de::IgnoredAny> = response.json().await.map_err(|error| {
+            KvWriteError::from_status(
+                status,
+                format!("Cloudflare KV write returned {status}: {error}"),
+            )
+        })?;
         if !status.is_success() || !body.success {
-            return Err(format!(
-                "Cloudflare KV write returned {status}: {}",
-                api_error_summary(&body.errors)
+            return Err(KvWriteError::from_status(
+                status,
+                format!(
+                    "Cloudflare KV write returned {status}: {}",
+                    api_error_summary(&body.errors)
+                ),
             ));
         }
         Ok(())
@@ -145,7 +181,7 @@ impl KvBackend {
     /// Returns a cached ID or lists namespace pages until a title matches.
     ///
     /// Example: failed startup lookup -> next scheduled report tries again.
-    async fn resolve_namespace(&self) -> Result<String, String> {
+    async fn resolve_namespace(&self) -> Result<String, KvWriteError> {
         if let Some(id) = self.namespace_id.read().await.as_ref() {
             return Ok(id.clone());
         }
@@ -160,30 +196,38 @@ impl KvBackend {
                 .bearer_auth(&self.token)
                 .send()
                 .await
-                .map_err(|error| format!("Cloudflare namespace lookup failed: {error}"))?;
+                .map_err(|error| {
+                    KvWriteError::Retryable(format!("Cloudflare namespace lookup failed: {error}"))
+                })?;
             let status = response.status();
             let body: ApiResponse<Vec<Namespace>> = response.json().await.map_err(|error| {
-                format!("Cloudflare namespace lookup returned {status}: {error}")
+                KvWriteError::from_status(
+                    status,
+                    format!("Cloudflare namespace lookup returned {status}: {error}"),
+                )
             })?;
             if !status.is_success() || !body.success {
-                return Err(format!(
-                    "Cloudflare namespace lookup returned {status}: {}",
-                    api_error_summary(&body.errors)
+                return Err(KvWriteError::from_status(
+                    status,
+                    format!(
+                        "Cloudflare namespace lookup returned {status}: {}",
+                        api_error_summary(&body.errors)
+                    ),
                 ));
             }
-            let namespaces = body
-                .result
-                .ok_or("Cloudflare namespace lookup omitted result")?;
+            let namespaces = body.result.ok_or_else(|| {
+                KvWriteError::Permanent("Cloudflare namespace lookup omitted result".to_string())
+            })?;
             if let Some(found) = namespaces.iter().find(|item| item.title == self.namespace) {
                 let id = found.id.clone();
                 *self.namespace_id.write().await = Some(id.clone());
                 return Ok(id);
             }
             if namespaces.len() < NAMESPACES_PER_PAGE {
-                return Err(format!(
+                return Err(KvWriteError::Permanent(format!(
                     "Cloudflare namespace {:?} not found",
                     self.namespace
-                ));
+                )));
             }
             page += 1;
         }

@@ -9,11 +9,12 @@ use tokio::time::{self, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
 use crate::access_uuid::AccessUuid;
-use crate::discovery::kv::KvBackend;
+use crate::discovery::kv::{KvBackend, KvWriteError};
 use crate::discovery::Report;
 
 const CENTER_INTERVAL: Duration = Duration::from_secs(3);
 const KV_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const KV_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const CENTER_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Destination and change signal for a daemon reporter.
@@ -126,75 +127,105 @@ impl Reporter {
         })
     }
 
-    /// Sends immediately, then on the backend interval or a KV UUID change.
+    /// Runs the scheduling policy selected by the active backend.
     ///
-    /// Example: KV UUID rotation -> report now instead of waiting one hour.
+    /// Example: KV failure -> retry every minute until a write succeeds.
     pub(crate) async fn run(self, shutdown: CancellationToken) {
-        let ready = match &self.backend {
-            Backend::CustomCenter { .. } => true,
-            // 触发条件: 启动时 namespace title 查询失败。
-            // 不能在 Connected 后马上重查: 用户要求失败后等下一次正常上报。
-            // 防止副作用: 不产生额外的 Cloudflare API 请求。
-            Backend::CfKv { kv, .. } => kv.is_ready().await,
-        };
-        if ready {
-            self.report_once().await;
+        match &self.backend {
+            Backend::CustomCenter { client, endpoint } => {
+                self.run_center(client, endpoint, shutdown).await
+            }
+            Backend::CfKv { kv, changed } => self.run_kv(kv, changed, shutdown).await,
         }
-        let period = match self.backend {
-            Backend::CustomCenter { .. } => CENTER_INTERVAL,
-            Backend::CfKv { .. } => KV_INTERVAL,
-        };
-        let start = time::Instant::now() + period;
-        let mut interval = time::interval_at(start, period);
+    }
+
+    /// Sends LAN-center reports immediately and every three seconds.
+    ///
+    /// Example: one center failure -> log once and continue the normal schedule.
+    async fn run_center(&self, client: &Client, endpoint: &Url, shutdown: CancellationToken) {
+        self.report_center_once(client, endpoint).await;
+        let start = time::Instant::now() + CENTER_INTERVAL;
+        let mut interval = time::interval_at(start, CENTER_INTERVAL);
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
-            match &self.backend {
-                Backend::CustomCenter { .. } => {
-                    tokio::select! {
-                        _ = shutdown.cancelled() => return,
-                        _ = interval.tick() => self.report_once().await,
-                    }
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = interval.tick() => self.report_center_once(client, endpoint).await,
+            }
+        }
+    }
+
+    /// Retries recoverable KV failures every minute until one write succeeds.
+    ///
+    /// Example: startup timeout -> retry after one minute, then resume hourly writes.
+    async fn run_kv(&self, kv: &KvBackend, changed: &Notify, shutdown: CancellationToken) {
+        let next_attempt = time::sleep(Duration::ZERO);
+        tokio::pin!(next_attempt);
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = changed.notified() => {
+                    next_attempt.as_mut().reset(time::Instant::now());
                 }
-                Backend::CfKv { changed, .. } => {
-                    tokio::select! {
-                        _ = shutdown.cancelled() => return,
-                        _ = interval.tick() => self.report_once().await,
-                        _ = changed.notified() => self.report_once().await,
-                    }
+                _ = &mut next_attempt => {
+                    let delay = match self.report_kv_once(kv).await {
+                        Ok(()) => KV_INTERVAL,
+                        Err(error) if error.should_retry() => {
+                            // 触发条件: 网络、限流或服务端故障中断本次 KV 更新。
+                            // 不能等待一小时: 短暂启动抖动会让新 endpoint 长时间不可发现。
+                            // 防止副作用: 单任务串行重试，避免并发写入覆盖最新状态。
+                            eprintln!(
+                                "discovery report failed: {error}; retrying in 60 seconds"
+                            );
+                            KV_RETRY_INTERVAL
+                        }
+                        Err(error) => {
+                            eprintln!("discovery report failed: {error}");
+                            KV_INTERVAL
+                        }
+                    };
+                    next_attempt.as_mut().reset(time::Instant::now() + delay);
                 }
             }
         }
     }
 
-    /// Builds the latest wire record and sends it through the active backend.
+    /// Builds the latest discovery record from the shared UUID state.
     ///
     /// Example: UUID age `17s` -> JSON containing `code_age_seconds: 17`.
-    async fn report_once(&self) {
+    async fn current_report(&self) -> Report {
         let (code, code_age_seconds) = self.access_uuid.read().await.report_snapshot();
-        let report = Report {
+        Report {
             key: self.key.clone(),
             cf: self.cf.clone(),
             code,
             code_age_seconds,
             hostname: self.hostname.clone(),
             ip: self.target_ip.to_string(),
-        };
-        let result = match &self.backend {
-            Backend::CustomCenter { client, endpoint } => client
-                .post(endpoint.clone())
-                .json(&report)
-                .send()
-                .await
-                .and_then(reqwest::Response::error_for_status)
-                .map(|_| ())
-                .map_err(|error| error.to_string()),
-            Backend::CfKv { kv, .. } => kv.write(&report).await,
-        };
-        if let Err(error) = result {
-            // 触发条件: 一次上报失败，但隧道本身仍可继续服务。
-            // 不能因此退出或额外重试: 用户要求等下一次正常上报时机。
-            // 防止副作用: 后端故障不影响代理连接，也不产生重复写入。
+        }
+    }
+
+    /// Sends one report to the custom LAN center.
+    ///
+    /// Example: HTTP 500 -> log the failure without stopping the tunnel.
+    async fn report_center_once(&self, client: &Client, endpoint: &Url) {
+        let report = self.current_report().await;
+        if let Err(error) = client
+            .post(endpoint.clone())
+            .json(&report)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+        {
             eprintln!("discovery report failed: {error}");
         }
+    }
+
+    /// Sends one report through the Cloudflare KV backend.
+    ///
+    /// Example: HTTP 429 -> a retryable error returned to the scheduler.
+    async fn report_kv_once(&self, kv: &KvBackend) -> Result<(), KvWriteError> {
+        let report = self.current_report().await;
+        kv.write(&report).await
     }
 }
