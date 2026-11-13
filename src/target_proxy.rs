@@ -52,7 +52,7 @@ impl Target {
     /// Resolves one request port under this target policy.
     ///
     /// Example: daemon target plus `Some(80)` -> `127.0.0.1:80`.
-    fn resolve(&self, requested_port: Option<u16>) -> Result<String, String> {
+    pub(crate) fn resolve(&self, requested_port: Option<u16>) -> Result<String, String> {
         match self {
             Self::Fixed { address } if requested_port.is_none() => Ok(address.clone()),
             Self::Fixed { .. } => Err("target does not allow a port override".to_string()),
@@ -99,6 +99,10 @@ pub(crate) async fn handle_request(
         reject_request(request, 403).await?;
         return Ok(());
     };
+    if request_url_path(request_url).as_deref() != Some(WEBSOCKET_PATH) {
+        reject_request(request, 404).await?;
+        return Ok(());
+    }
     if request.kind != RequestKind::WebSocket {
         reject_request(request, 404).await?;
         return Ok(());
@@ -118,7 +122,6 @@ pub(crate) async fn handle_request(
         }
     };
 
-    let accept = websocket_accept_value(&request)?;
     let tcp = TcpStream::connect(&target)
         .await
         .map_err(|error| format!("connect target {target} failed: {error}"))?;
@@ -135,17 +138,7 @@ pub(crate) async fn handle_request(
         },
         None => None,
     };
-    let mut response = CfResponse::new(101);
-    response.headers.insert(
-        http::header::SEC_WEBSOCKET_ACCEPT,
-        http::HeaderValue::from_str(&accept)
-            .map_err(|error| format!("invalid websocket accept header: {error}"))?,
-    );
-    let stream = request
-        .respond(response)
-        .await
-        .map_err(|error| format!("respond websocket failed: {error}"))?;
-    let websocket = WebSocketStream::from_raw_socket(stream, Role::Server, None).await;
+    let websocket = upgrade_websocket(request).await?;
     bridge_tcp_websocket(tcp, websocket).await
 }
 
@@ -195,7 +188,7 @@ fn parse_request_url(raw: &str) -> Option<Url> {
 /// Rejects one Cloudflare request before it reaches the target.
 ///
 /// Example: stale UUID -> HTTP-like status `403`.
-async fn reject_request(request: IncomingRequest, status: u16) -> Result<(), String> {
+pub(crate) async fn reject_request(request: IncomingRequest, status: u16) -> Result<(), String> {
     request
         .reject(status)
         .await
@@ -205,7 +198,10 @@ async fn reject_request(request: IncomingRequest, status: u16) -> Result<(), Str
 /// Finds URL-bearing Cloudflare metadata containing any accepted UUID.
 ///
 /// Example: destination carrying current or previous UUID returns that destination.
-fn matching_request_url<'a>(request: &'a IncomingRequest, expected: &[String]) -> Option<&'a str> {
+pub(crate) fn matching_request_url<'a>(
+    request: &'a IncomingRequest,
+    expected: &[String],
+) -> Option<&'a str> {
     // 触发条件: Cloudflare metadata 字段随入口协议变化。
     // 不能直接依赖单字段: QUIC 与 HTTP/2 提供的字段不同。
     // 防止副作用: 避免字段名差异导致正确 URL 被误拒。
@@ -221,6 +217,34 @@ fn matching_request_url<'a>(request: &'a IncomingRequest, expected: &[String]) -
         })
         .find(|(_, value)| request_url_matches(value, expected))
         .map(|(_, value)| value.as_str())
+}
+
+/// Finds the request path used by the proxy facade to choose legacy or mux handling.
+///
+/// Example: Cloudflare metadata containing `/mux?code=x` returns `/mux`.
+pub(crate) fn request_path(request: &IncomingRequest) -> Option<String> {
+    if let Some(path) =
+        request_url_path(&request.destination).filter(|path| path == "/tcp" || path == "/mux")
+    {
+        return Some(path);
+    }
+    request
+        .metadata
+        .iter()
+        .filter(|(key, _)| {
+            let key = key.to_ascii_lowercase();
+            key.contains("path") || key.contains("uri") || key.contains("url")
+        })
+        .find_map(|(_, value)| {
+            request_url_path(value).filter(|path| path == "/tcp" || path == "/mux")
+        })
+}
+
+/// Parses only the path component of a complete URL or Cloudflare request target.
+///
+/// Example: `/tcp?code=x -> /tcp`.
+pub(crate) fn request_url_path(raw: &str) -> Option<String> {
+    parse_request_url(raw).map(|url| url.path().to_string())
 }
 
 /// Checks whether one request URL carries any UUID from an acceptance snapshot.
@@ -247,6 +271,26 @@ fn websocket_accept_value(request: &IncomingRequest) -> Result<String, String> {
     digest.update(key.as_bytes());
     digest.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
     Ok(BASE64.encode(digest.finalize()))
+}
+
+/// Upgrades one already authenticated Cloudflare request to a server WebSocket.
+///
+/// Example: both legacy and mux handlers reuse the same RFC 6455 response path.
+pub(crate) async fn upgrade_websocket(
+    request: IncomingRequest,
+) -> Result<WebSocketStream<CfStream>, String> {
+    let accept = websocket_accept_value(&request)?;
+    let mut response = CfResponse::new(101);
+    response.headers.insert(
+        http::header::SEC_WEBSOCKET_ACCEPT,
+        http::HeaderValue::from_str(&accept)
+            .map_err(|error| format!("invalid websocket accept header: {error}"))?,
+    );
+    let stream = request
+        .respond(response)
+        .await
+        .map_err(|error| format!("respond websocket failed: {error}"))?;
+    Ok(WebSocketStream::from_raw_socket(stream, Role::Server, None).await)
 }
 
 /// Bridges target TCP bytes and Cloudflare WebSocket frames bidirectionally.

@@ -4,6 +4,7 @@ mod connection_activity;
 mod daemon;
 mod discovery;
 mod endpoint;
+mod proxy;
 mod target_proxy;
 
 /// Generated Cloudflare QUIC request-stream schema.
@@ -22,28 +23,22 @@ pub(crate) mod tunnelrpc_capnp {
     include!(concat!(env!("OUT_DIR"), "/tunnelrpc_capnp.rs"));
 }
 
-use bytes::Bytes;
 use cf_lib::SessionEvent;
 use eframe::egui;
-use futures_util::{SinkExt, StreamExt};
 use std::env;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command as TokioCommand;
 use tokio::runtime::{Builder, Handle};
 use tokio::task::JoinHandle;
 use tokio::time;
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as TokioMessage};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
 const DEFAULT_YY_LISTEN: &str = "0.0.0.0:0";
 const DEFAULT_NAS_SSH_PORT: &str = "22";
-/// Interval between yy-originated WebSocket heartbeat frames.
-const WEBSOCKET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// CLI mode selected from process arguments.
 ///
@@ -69,6 +64,8 @@ enum LaunchMode {
 struct YyConfig {
     /// WSS endpoint source.
     endpoint: endpoint::Spec,
+    /// Proxy protocol selected once for all accepted TCP connections.
+    mode: proxy::Mode,
     /// Local TCP listener address used by yy.
     listen_addr: String,
 }
@@ -89,6 +86,8 @@ struct XxConfig {
 struct ZzConfig {
     /// WSS endpoint source.
     endpoint: endpoint::Spec,
+    /// Proxy protocol selected once for the child command.
+    mode: proxy::Mode,
     /// Command vector after `--`, with `{PORT}` placeholders.
     command: Vec<String>,
 }
@@ -227,6 +226,7 @@ fn parse_yy_mode(args: &[String]) -> Result<LaunchMode, String> {
             .cloned()
             .ok_or_else(launch_usage)?;
         let mut query = None;
+        let mut mode = proxy::Mode::Mux;
         let mut listen_addr = DEFAULT_YY_LISTEN.to_string();
         let mut index = 2;
         while index < args.len() {
@@ -240,6 +240,11 @@ fn parse_yy_mode(args: &[String]) -> Result<LaunchMode, String> {
                     );
                     index += 2;
                 }
+                "-legacy" if mode == proxy::Mode::Mux => {
+                    mode = proxy::Mode::Legacy;
+                    index += 1;
+                }
+                "-legacy" => return Err(launch_usage()),
                 _ if index + 1 == args.len() && listen_addr == DEFAULT_YY_LISTEN => {
                     listen_addr = args[index].clone();
                     index += 1;
@@ -249,16 +254,29 @@ fn parse_yy_mode(args: &[String]) -> Result<LaunchMode, String> {
         }
         return Ok(LaunchMode::Yy(YyConfig {
             endpoint: endpoint::Spec::Kv { key, query },
+            mode,
             listen_addr,
         }));
     }
     match args {
+        [legacy, wss_url] if legacy == "-legacy" => Ok(LaunchMode::Yy(YyConfig {
+            endpoint: endpoint::Spec::Url(wss_url.clone()),
+            mode: proxy::Mode::Legacy,
+            listen_addr: DEFAULT_YY_LISTEN.to_string(),
+        })),
+        [legacy, wss_url, listen_addr] if legacy == "-legacy" => Ok(LaunchMode::Yy(YyConfig {
+            endpoint: endpoint::Spec::Url(wss_url.clone()),
+            mode: proxy::Mode::Legacy,
+            listen_addr: listen_addr.clone(),
+        })),
         [wss_url] => Ok(LaunchMode::Yy(YyConfig {
             endpoint: endpoint::Spec::Url(wss_url.clone()),
+            mode: proxy::Mode::Mux,
             listen_addr: DEFAULT_YY_LISTEN.to_string(),
         })),
         [wss_url, listen_addr] => Ok(LaunchMode::Yy(YyConfig {
             endpoint: endpoint::Spec::Url(wss_url.clone()),
+            mode: proxy::Mode::Mux,
             listen_addr: listen_addr.clone(),
         })),
         _ => Err(launch_usage()),
@@ -276,7 +294,11 @@ fn parse_zz_mode(args: &[String]) -> Result<LaunchMode, String> {
     if separator == 0 || separator + 1 >= args.len() {
         return Err(launch_usage());
     }
-    let endpoint_args = &args[..separator];
+    let raw_endpoint_args = &args[..separator];
+    let (mode, endpoint_args) = match raw_endpoint_args.split_first() {
+        Some((flag, rest)) if flag == "-legacy" => (proxy::Mode::Legacy, rest),
+        _ => (proxy::Mode::Mux, raw_endpoint_args),
+    };
     let command = args[separator + 1..].to_vec();
     let endpoint = match endpoint_args {
         [wss_url] => endpoint::Spec::Url(wss_url.clone()),
@@ -297,14 +319,18 @@ fn parse_zz_mode(args: &[String]) -> Result<LaunchMode, String> {
         }
         _ => return Err(launch_usage()),
     };
-    Ok(LaunchMode::Zz(ZzConfig { endpoint, command }))
+    Ok(LaunchMode::Zz(ZzConfig {
+        endpoint,
+        mode,
+        command,
+    }))
 }
 
 /// Returns the public command syntax.
 ///
 /// Example: malformed `-kvk` arguments -> this usage string.
 fn launch_usage() -> String {
-    "usage: tmp-proxy | tmp-proxy xx <target> <username> | tmp-proxy -yy <wss_url> [listen_addr] | tmp-proxy -yy -kvk <full_kv_key> [-query <query>] [listen_addr] | tmp-proxy zz <wss_url> -- <command...> | tmp-proxy zz -kvk <full_kv_key> [-query <query>] -- <command...> | tmp-proxy -daemon ... | tmp-proxy -center ...".to_string()
+    "usage: tmp-proxy | tmp-proxy xx <target> <username> | tmp-proxy -yy [-legacy] <wss_url> [listen_addr] | tmp-proxy -yy -kvk <full_kv_key> [-query <query>] [-legacy] [listen_addr] | tmp-proxy zz [-legacy] <wss_url> -- <command...> | tmp-proxy zz [-legacy] -kvk <full_kv_key> [-query <query>] -- <command...> | tmp-proxy -daemon ... | tmp-proxy -center ...".to_string()
 }
 
 /// Runs the native xx GUI.
@@ -714,6 +740,7 @@ async fn run_cf_tunnel(
     cancel: CancellationToken,
 ) -> Result<(), String> {
     send_status(&sender, "creating trycloudflare tunnel".to_string());
+    let request_proxy = proxy::Server::new(target_proxy::Target::fixed(target));
     loop {
         let quick_tunnel = cf_lib::create_quick_tunnel()
             .await
@@ -764,12 +791,11 @@ async fn run_cf_tunnel(
                 },
                 request = session.accept() => {
                     let request = request.map_err(|error| format!("accept tunnel request failed: {error}"))?;
-                    let target = target_proxy::Target::fixed(target.clone());
+                    let request_proxy = request_proxy.clone();
                     let pairing_uuid = pairing_uuid.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = target_proxy::handle_request(
+                        if let Err(error) = request_proxy.handle_request(
                             request,
-                            target,
                             vec![pairing_uuid],
                             None,
                         ).await {
@@ -806,6 +832,7 @@ fn shell_quote_single(raw: &str) -> String {
 async fn run_yy(config: YyConfig) -> Result<(), String> {
     let endpoint = endpoint::Source::start(config.endpoint, endpoint::Consumer::Yy).await?;
     validate_yy_url(&endpoint.current())?;
+    let proxy = Arc::new(proxy::Client::new(config.mode, endpoint)?);
     let listener = TcpListener::bind(&config.listen_addr)
         .await
         .map_err(|err| format!("listen {} failed: {err}", config.listen_addr))?;
@@ -819,9 +846,9 @@ async fn run_yy(config: YyConfig) -> Result<(), String> {
             .accept()
             .await
             .map_err(|err| format!("accept failed: {err}"))?;
-        let mut endpoint = endpoint.clone();
+        let proxy = Arc::clone(&proxy);
         tokio::spawn(async move {
-            if let Err(err) = handle_yy_tcp_connection(stream, &mut endpoint).await {
+            if let Err(err) = proxy.handle_tcp(stream).await {
                 eprintln!("{peer}: {err}");
             }
         });
@@ -834,6 +861,7 @@ async fn run_yy(config: YyConfig) -> Result<(), String> {
 async fn run_zz(config: ZzConfig) -> Result<i32, String> {
     let endpoint = endpoint::Source::start(config.endpoint, endpoint::Consumer::Zz).await?;
     validate_yy_url(&endpoint.current())?;
+    let proxy = Arc::new(proxy::Client::new(config.mode, endpoint)?);
     let listener = TcpListener::bind(DEFAULT_YY_LISTEN)
         .await
         .map_err(|err| format!("listen {DEFAULT_YY_LISTEN} failed: {err}"))?;
@@ -843,7 +871,7 @@ async fn run_zz(config: ZzConfig) -> Result<i32, String> {
     let command = replace_port_placeholders(config.command, addr.port());
     let mut child = spawn_zz_command(&command)?;
     let cancel = CancellationToken::new();
-    let mut accept_task = tokio::spawn(run_zz_accept_loop(listener, endpoint, cancel.clone()));
+    let mut accept_task = tokio::spawn(run_zz_accept_loop(listener, proxy, cancel.clone()));
 
     println!("listening {addr}");
     println!("running {}", command.join(" "));
@@ -895,7 +923,7 @@ fn spawn_zz_command(command: &[String]) -> Result<tokio::process::Child, String>
 /// Example: every local ssh connection is bridged to the remote WebSocket URL.
 async fn run_zz_accept_loop(
     listener: TcpListener,
-    endpoint: endpoint::Source,
+    proxy: Arc<proxy::Client>,
     cancel: CancellationToken,
 ) -> Result<(), String> {
     loop {
@@ -903,9 +931,9 @@ async fn run_zz_accept_loop(
             _ = cancel.cancelled() => return Ok(()),
             accepted = listener.accept() => {
                 let (stream, peer) = accepted.map_err(|err| format!("accept failed: {err}"))?;
-                let mut endpoint = endpoint.clone();
+                let proxy = Arc::clone(&proxy);
                 tokio::spawn(async move {
-                    if let Err(err) = handle_yy_tcp_connection(stream, &mut endpoint).await {
+                    if let Err(err) = proxy.handle_tcp(stream).await {
                         eprintln!("{peer}: {err}");
                     }
                 });
@@ -931,95 +959,4 @@ fn validate_yy_url(wss_url: &str) -> Result<(), String> {
     target_proxy::extract_target_port(wss_url)
         .map_err(|error| format!("yy url has invalid port: {error}"))?;
     Ok(())
-}
-
-/// Handles one local yy TCP connection and retries once after a changed KV endpoint.
-///
-/// Example: an expired hostname refreshes KV, then the same SSH socket uses the new URL.
-async fn handle_yy_tcp_connection(
-    stream: TcpStream,
-    endpoint: &mut endpoint::Source,
-) -> Result<(), String> {
-    let wss_url = endpoint.current();
-    let first_error = match connect_async(&wss_url).await {
-        Ok((ws, _)) => return bridge_tcp_tokio_ws(stream, ws).await,
-        Err(error) => error,
-    };
-    let Some(refreshed) = endpoint.refresh_after_failure(&wss_url).await else {
-        return Err(format!("connect websocket failed: {first_error}"));
-    };
-    let (ws, _) = connect_async(&refreshed).await.map_err(|error| {
-        format!("connect refreshed websocket failed: {error}; initial error: {first_error}")
-    })?;
-    bridge_tcp_tokio_ws(stream, ws).await
-}
-
-/// Bridges a TCP stream and a tokio-tungstenite WebSocket in both directions.
-///
-/// Example: TCP SSH bytes are sent as WS binary frames and back.
-async fn bridge_tcp_tokio_ws<S>(
-    tcp: TcpStream,
-    ws: tokio_tungstenite::WebSocketStream<S>,
-) -> Result<(), String>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    let (mut tcp_reader, mut tcp_writer) = tcp.into_split();
-    let (mut ws_writer, mut ws_reader) = ws.split();
-
-    let tcp_to_ws = async {
-        let mut buffer = vec![0_u8; 16 * 1024];
-        let first_heartbeat = time::Instant::now() + WEBSOCKET_HEARTBEAT_INTERVAL;
-        let mut heartbeat = time::interval_at(first_heartbeat, WEBSOCKET_HEARTBEAT_INTERVAL);
-        heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                read = tcp_reader.read(&mut buffer) => {
-                    let len = read.map_err(|err| format!("read tcp failed: {err}"))?;
-                    if len == 0 {
-                        let _ = ws_writer.close().await;
-                        return Ok::<(), String>(());
-                    }
-                    ws_writer
-                        .send(TokioMessage::Binary(Bytes::copy_from_slice(&buffer[..len])))
-                        .await
-                        .map_err(|err| format!("write websocket failed: {err}"))?;
-                }
-                _ = heartbeat.tick() => {
-                    // 触发条件：SSH 空闲时可能长期没有 TCP 业务数据。
-                    // 常规路径不够：tungstenite 只自动回复，不主动发送 Ping。
-                    // 防止回归：周期心跳避免公网 WSS 被空闲超时清理。
-                    ws_writer
-                        .send(TokioMessage::Ping(Bytes::new()))
-                        .await
-                        .map_err(|err| format!("write websocket heartbeat failed: {err}"))?;
-                }
-            }
-        }
-    };
-
-    let ws_to_tcp = async {
-        while let Some(message) = ws_reader.next().await {
-            let message = message.map_err(|err| format!("read websocket failed: {err}"))?;
-            match message {
-                TokioMessage::Binary(data) => tcp_writer
-                    .write_all(&data)
-                    .await
-                    .map_err(|err| format!("write tcp failed: {err}"))?,
-                TokioMessage::Text(text) => tcp_writer
-                    .write_all(text.as_bytes())
-                    .await
-                    .map_err(|err| format!("write tcp text failed: {err}"))?,
-                TokioMessage::Close(_) => break,
-                TokioMessage::Ping(_) | TokioMessage::Pong(_) | TokioMessage::Frame(_) => {}
-            }
-        }
-        let _ = tcp_writer.shutdown().await;
-        Ok::<(), String>(())
-    };
-
-    tokio::select! {
-        result = tcp_to_ws => result,
-        result = ws_to_tcp => result,
-    }
 }

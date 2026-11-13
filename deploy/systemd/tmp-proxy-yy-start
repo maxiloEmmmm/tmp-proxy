@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Load only the root-owned service environment before starting KV-backed yy mode.
-# Example: cfp/demo plus port=10808 -> local 127.0.0.1:9010 proxy.
+# Example: cfp/demo plus port=22 -> local 127.0.0.1:9010 proxy.
 set -euo pipefail
 
 env_file=/etc/cfp/env
@@ -19,5 +19,5 @@ export CF_TOKEN
 exec /usr/local/bin/tmp-proxy \
     -yy \
     -kvk cfp/demo \
-    -query port=10808 \
+    -query port=22 \
     127.0.0.1:9010

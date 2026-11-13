@@ -14,6 +14,7 @@ use crate::connection_activity::ConnectionActivity;
 use crate::discovery::config::{self, BackendConfig};
 use crate::discovery::kv::KvBackend;
 use crate::discovery::reporter::Reporter;
+use crate::proxy;
 use crate::target_proxy;
 
 const DEFAULT_TARGET_PORT: u16 = 22;
@@ -122,6 +123,10 @@ impl Config {
 pub(crate) async fn run(config: Config) -> Result<(), String> {
     let target = config.target_addr();
     check_target(target).await?;
+    let request_proxy = proxy::Server::new(target_proxy::Target::with_port_override(
+        config.target_ip,
+        config.target_port,
+    ));
     let reporter_backend = match config.reporter {
         Some(BackendConfig::CustomCenter(center)) => Some(ActiveReporter::CustomCenter(center)),
         Some(BackendConfig::CfKv(kv_config)) => {
@@ -281,15 +286,11 @@ pub(crate) async fn run(config: Config) -> Result<(), String> {
                     // 不能在异步处理器中再次读取共享 UUID: 调度延迟会改变判定时点。
                     // 防止副作用: 接入时快照保证轮换不影响已接入及已建立的连接。
                     let expected_uuids = access_uuid.read().await.accepted_values();
-                    let target = target_proxy::Target::with_port_override(
-                        config.target_ip,
-                        config.target_port,
-                    );
+                    let request_proxy = request_proxy.clone();
                     let activity = activity.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = target_proxy::handle_request(
+                        if let Err(error) = request_proxy.handle_request(
                             request,
-                            target,
                             expected_uuids,
                             activity,
                         ).await {

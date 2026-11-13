@@ -1,0 +1,27 @@
+[Unit]
+Description=tmp-proxy KV-backed yy proxy
+Wants=network-online.target
+After=network-online.target tmp-proxy-daemon.service
+
+[Service]
+Type=exec
+User=root
+Environment=CFP_CONFIG=/etc/cfp/config.yaml
+ExecStart=/usr/local/bin/tmp-proxy-yy-start
+Restart=always
+RestartSec=5s
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

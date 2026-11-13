@@ -1,0 +1,27 @@
+[Unit]
+Description=tmp-proxy yy proxy for remote port 9000
+Wants=network-online.target
+After=network-online.target tmp-proxy-daemon.service
+
+[Service]
+Type=exec
+User=root
+Environment=CFP_CONFIG=/etc/cfp/config.yaml
+ExecStart=/usr/bin/bash -c 'source /etc/cfp/env; exec /usr/local/bin/tmp-proxy -yy -kvk cfp/demo -query port=9000 127.0.0.1:9092'
+Restart=always
+RestartSec=5s
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
