@@ -474,3 +474,227 @@ async fn crossed_resets_keep_connection_alive() {
     assert_eq!(client_two.id(), 3);
     assert_eq!(server_two.id(), 3);
 }
+
+/// Verifies OPEN returns before target acknowledgement and permits client-first DATA.
+///
+/// Example: stream 1 sends `hello` while its server state is still opening.
+#[tokio::test]
+async fn open_returns_and_sends_data_before_open_ok() {
+    let (client, server) = peer_pair(Config::default());
+    let client_stream = time::timeout(Duration::from_secs(1), client.open(10808))
+        .await
+        .expect("OPEN must not wait for OPEN_OK")
+        .expect("OPEN carrier handoff");
+    let incoming = server.accept().await.expect("accept pending OPEN");
+    assert_eq!(
+        incoming
+            .stream
+            .as_ref()
+            .expect("pending server stream")
+            .state
+            .open_state
+            .load(std::sync::atomic::Ordering::Acquire),
+        super::STREAM_OPENING
+    );
+
+    client_stream
+        .reserve_send()
+        .await
+        .expect("reserve early DATA")
+        .send(Bytes::from_static(b"hello"))
+        .await
+        .expect("send early DATA");
+    let queued = incoming
+        .stream
+        .as_ref()
+        .expect("pending server stream")
+        .recv_chunk()
+        .await
+        .expect("receive early DATA");
+    assert_eq!(&queued[..], b"hello");
+
+    let server_stream = incoming.accept().await.expect("acknowledge OPEN");
+    assert_eq!(client_stream.id(), server_stream.id());
+}
+
+/// Verifies pre-ack DATA remains bounded by stream and connection windows.
+///
+/// Example: four bytes stop the next four until the daemon consumes the first chunk.
+#[tokio::test]
+async fn early_data_obeys_window_before_open_ok() {
+    let config = Config {
+        stream_window: 4,
+        connection_window: 4,
+        max_frame: 4,
+        max_streams: 1,
+    };
+    let (client, server) = peer_pair(config);
+    let client_stream = client.open(10808).await.expect("open early stream");
+    let incoming = server.accept().await.expect("accept pending OPEN");
+    let sending = tokio::spawn(async move {
+        client_stream
+            .reserve_send()
+            .await
+            .expect("reserve first early chunk")
+            .send(Bytes::from_static(b"1234"))
+            .await
+            .expect("send first early chunk");
+        client_stream
+            .reserve_send()
+            .await
+            .expect("reserve second early chunk")
+            .send(Bytes::from_static(b"5678"))
+            .await
+            .expect("send second early chunk");
+        client_stream
+    });
+
+    let remote = incoming.stream.as_ref().expect("pending server stream");
+    let first = remote
+        .recv_chunk()
+        .await
+        .expect("receive first early chunk");
+    assert_eq!(&first[..], b"1234");
+    time::sleep(Duration::from_millis(20)).await;
+    assert!(!sending.is_finished());
+    remote
+        .consumed(first.len())
+        .await
+        .expect("return early DATA credit");
+    let second = remote
+        .recv_chunk()
+        .await
+        .expect("receive second early chunk");
+    assert_eq!(&second[..], b"5678");
+
+    let client_stream = sending.await.expect("join early DATA sender");
+    let server_stream = incoming.accept().await.expect("acknowledge OPEN");
+    assert_eq!(client_stream.id(), server_stream.id());
+}
+
+/// Verifies rejection drains in-flight DATA through RESET and restores all capacity.
+///
+/// Example: rejected full-window id 1 is followed by healthy id 3 on the same carrier.
+#[tokio::test]
+async fn rejected_early_data_restores_window_and_stream_slot() {
+    let config = Config {
+        stream_window: 4,
+        connection_window: 4,
+        max_frame: 4,
+        max_streams: 1,
+    };
+    let (client, server) = peer_pair(config);
+    let rejected = client.open(10808).await.expect("open rejected stream");
+    let incoming = server.accept().await.expect("accept rejected OPEN");
+    rejected
+        .reserve_send()
+        .await
+        .expect("reserve rejected DATA")
+        .send(Bytes::from_static(b"drop"))
+        .await
+        .expect("send rejected DATA");
+    incoming.reject(2).await.expect("reject pending OPEN");
+    time::timeout(Duration::from_secs(1), rejected.closed())
+        .await
+        .expect("OPEN_ERROR closed client stream");
+
+    let (client_stream, server_stream) =
+        time::timeout(Duration::from_secs(1), open_stream_pair(&client, &server))
+            .await
+            .expect("RESET restored stream slot");
+    client_stream
+        .reserve_send()
+        .await
+        .expect("rejection restored connection credit")
+        .send(Bytes::from_static(b"next"))
+        .await
+        .expect("send successor DATA");
+    assert_eq!(
+        &server_stream.recv_chunk().await.expect("receive successor")[..],
+        b"next"
+    );
+    assert_eq!(client_stream.id(), 3);
+}
+
+/// Verifies concurrent pre-ack streams retain independent queues and identifiers.
+///
+/// Example: streams 1 and 3 carry `one` and `two` without cross-talk before either OPEN_OK.
+#[tokio::test]
+async fn concurrent_early_streams_are_isolated() {
+    let (client, server) = peer_pair(Config::default());
+    let client_one = client.open(10808).await.expect("open first stream");
+    let client_two = client.open(10808).await.expect("open second stream");
+    let incoming_one = server.accept().await.expect("accept first OPEN");
+    let incoming_two = server.accept().await.expect("accept second OPEN");
+
+    client_one
+        .reserve_send()
+        .await
+        .expect("reserve first DATA")
+        .send(Bytes::from_static(b"one"))
+        .await
+        .expect("send first DATA");
+    client_two
+        .reserve_send()
+        .await
+        .expect("reserve second DATA")
+        .send(Bytes::from_static(b"two"))
+        .await
+        .expect("send second DATA");
+    assert_eq!(
+        &incoming_one
+            .stream
+            .as_ref()
+            .expect("first pending stream")
+            .recv_chunk()
+            .await
+            .expect("receive first DATA")[..],
+        b"one"
+    );
+    assert_eq!(
+        &incoming_two
+            .stream
+            .as_ref()
+            .expect("second pending stream")
+            .recv_chunk()
+            .await
+            .expect("receive second DATA")[..],
+        b"two"
+    );
+    assert_eq!(incoming_one.accept().await.expect("accept first").id(), 1);
+    assert_eq!(incoming_two.accept().await.expect("accept second").id(), 3);
+}
+
+/// Verifies a crossed late OPEN_OK after local RESET is harmless to the carrier.
+///
+/// Example: removed stream 1 ignores its delayed acknowledgement, then stream 3 opens normally.
+#[tokio::test]
+async fn late_open_ok_after_reset_keeps_carrier_alive() {
+    let (client, server) = peer_pair(Config::default());
+    let client_one = client.open(10808).await.expect("open first stream");
+    let incoming_one = server.accept().await.expect("accept first OPEN");
+    let stream_id = client_one.id();
+    client_one.reset(7).await.expect("reset opening stream");
+
+    super::handle_frame(
+        &client.inner,
+        crate::proxy::mux::protocol::Frame::OpenOk { stream_id },
+    )
+    .await
+    .expect("ignore crossed OPEN_OK");
+    time::timeout(
+        Duration::from_secs(1),
+        incoming_one
+            .stream
+            .as_ref()
+            .expect("pending first stream")
+            .closed(),
+    )
+    .await
+    .expect("server received opening RESET");
+    assert!(incoming_one.accept().await.is_err());
+
+    let (client_two, server_two) = open_stream_pair(&client, &server).await;
+    assert_eq!(client_two.id(), 3);
+    assert_eq!(server_two.id(), 3);
+}

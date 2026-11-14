@@ -1,9 +1,10 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering},
         Arc, Mutex, Weak,
     },
+    time::Duration,
 };
 
 use bytes::Bytes;
@@ -36,6 +37,18 @@ const DATAGRAM_QUEUE_PACKETS: usize = 64;
 
 /// Maximum aggregate UDP payload retained for one association.
 const DATAGRAM_QUEUE_BYTES: usize = 128 * 1024;
+
+/// Maximum time a rejected stream retains in-flight DATA while awaiting RESET.
+const REJECTED_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Stream exists but its remote target has not acknowledged readiness.
+const STREAM_OPENING: u8 = 0;
+
+/// Stream target is ready and normal bidirectional forwarding is active.
+const STREAM_OPEN: u8 = 1;
+
+/// Stream target failed; queued DATA is retained until the peer RESET arrives.
+const STREAM_REJECTED: u8 = 2;
 
 /// Stable reset code used when a local TCP bridge fails.
 pub(super) const RESET_LOCAL_IO: u16 = 1;
@@ -132,8 +145,8 @@ struct StreamState {
     inbound: ByteQueue,
     /// Single-frame outbound slot preventing DATA queue buildup.
     data_slot: Arc<Semaphore>,
-    /// Completion channel for a locally initiated OPEN.
-    open_result: Mutex<Option<oneshot::Sender<Result<(), String>>>>,
+    /// Target readiness state independent from early DATA flow.
+    open_state: AtomicU8,
     /// Whether RESET or connection shutdown ended this stream.
     closed: AtomicBool,
     /// Wakes bridge tasks after stream termination.
@@ -279,30 +292,32 @@ impl Endpoint {
         })
     }
 
-    /// Opens one client-initiated logical stream and waits for remote target readiness.
+    /// Opens one client-initiated logical stream after OPEN reaches the carrier.
     ///
-    /// Example: target port 10808 returns a stream only after OPEN_OK.
+    /// Example: target port 10808 may send client-first bytes while the daemon connects it.
     pub(super) async fn open(&self, target_port: u16) -> Result<Stream, String> {
         if self.inner.role != Role::Client {
             return Err("invalid mux client open request".to_string());
         }
         let remote = self.inner.wait_remote().await?;
         let id = self.inner.allocate_stream_id(remote.max_streams)?;
-        let (state, stream) = self.inner.create_stream(id, &remote, true)?;
-        let (result_tx, result_rx) = oneshot::channel();
-        *state.open_result.lock().expect("mux open result poisoned") = Some(result_tx);
-        self.inner
+        let (_, stream) = self.inner.create_stream(id, &remote, true)?;
+        let result = self
+            .inner
             .outbound
-            .send_control(Frame::Open {
+            .send_ordered_control(Frame::Open {
                 stream_id: id,
                 target_port,
             })
-            .await?;
-        match result_rx.await {
-            Ok(Ok(())) => Ok(stream),
-            Ok(Err(error)) => Err(error),
-            Err(_) => Err("mux stream open was cancelled".to_string()),
+            .await;
+        if let Err(error) = result {
+            let _ = self
+                .inner
+                .remove_stream(id, "mux OPEN carrier handoff failed")
+                .await;
+            return Err(error);
         }
+        Ok(stream)
     }
 
     /// Accepts the next server-side OPEN without acknowledging it prematurely.
@@ -425,7 +440,7 @@ impl EndpointInner {
 
     /// Creates and registers one stream using limits from both hello messages.
     ///
-    /// Example: a client OPEN installs its result channel before sending the frame.
+    /// Example: a client OPEN registers state before its ordered carrier handoff.
     fn create_stream(
         self: &Arc<Self>,
         id: u32,
@@ -441,7 +456,7 @@ impl EndpointInner {
             )?),
             inbound: ByteQueue::new(self.config.stream_window as usize),
             data_slot: Arc::new(Semaphore::new(1)),
-            open_result: Mutex::new(None),
+            open_state: AtomicU8::new(STREAM_OPENING),
             closed: AtomicBool::new(false),
             closed_notify: Notify::new(),
         });
@@ -600,20 +615,12 @@ impl StreamState {
     /// Marks one stream closed and releases every blocked bridge operation.
     ///
     /// Example: RESET closes send windows and the inbound DATA queue.
-    fn close(&self, reason: &str) {
+    fn close(&self, _reason: &str) {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
         self.send_window.close();
         self.inbound.abort();
-        if let Some(result) = self
-            .open_result
-            .lock()
-            .expect("mux open result poisoned")
-            .take()
-        {
-            let _ = result.send(Err(reason.to_string()));
-        }
         self.closed_notify.notify_waiters();
     }
 }
@@ -917,6 +924,19 @@ impl IncomingStream {
             .stream
             .take()
             .ok_or_else(|| "mux incoming stream already resolved".to_string())?;
+        if stream.state.closed.load(Ordering::Acquire) {
+            return Err("mux incoming stream closed before target ready".to_string());
+        }
+        stream
+            .state
+            .open_state
+            .compare_exchange(
+                STREAM_OPENING,
+                STREAM_OPEN,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| "mux incoming stream was already resolved".to_string())?;
         let endpoint = stream
             .endpoint
             .upgrade()
@@ -938,20 +958,46 @@ impl IncomingStream {
             .stream
             .take()
             .ok_or_else(|| "mux incoming stream already resolved".to_string())?;
+        if stream.state.closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        stream
+            .state
+            .open_state
+            .compare_exchange(
+                STREAM_OPENING,
+                STREAM_REJECTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| "mux incoming stream was already resolved".to_string())?;
         let endpoint = stream
             .endpoint
             .upgrade()
             .ok_or_else(|| "mux endpoint released".to_string())?;
-        endpoint
-            .remove_stream(stream.id(), "remote target open failed")
-            .await?;
         endpoint
             .outbound
             .send_control(Frame::OpenError {
                 stream_id: stream.id(),
                 code,
             })
-            .await
+            .await?;
+
+        // 触发条件：目标连接失败，但客户端可能已有 DATA 在双向载体中飞行。
+        // 不能立即删状态：晚到 DATA 会被误判为未知 stream，并泄漏共享 window。
+        // 防止副作用：正常由客户端 RESET 精确回收；超时只兜底旧版或恶意客户端。
+        let stream_id = stream.id();
+        tokio::spawn(async move {
+            tokio::time::sleep(REJECTED_STREAM_TIMEOUT).await;
+            let rejected = optional_stream_state(&endpoint, stream_id)
+                .is_some_and(|state| state.open_state.load(Ordering::Acquire) == STREAM_REJECTED);
+            if rejected {
+                let _ = endpoint
+                    .remove_stream(stream_id, "rejected mux stream cleanup timeout")
+                    .await;
+            }
+        });
+        Ok(())
     }
 }
 
@@ -1053,15 +1099,8 @@ async fn handle_frame(inner: &Arc<EndpointInner>, frame: Frame) -> Result<(), St
             stream_id,
             target_port,
         } => handle_open(inner, &remote, stream_id, target_port).await,
-        Frame::OpenOk { stream_id } => complete_open(inner, stream_id, Ok(())).await,
-        Frame::OpenError { stream_id, code } => {
-            complete_open(
-                inner,
-                stream_id,
-                Err(format!("remote target open failed with code {code}")),
-            )
-            .await
-        }
+        Frame::OpenOk { stream_id } => handle_open_ok(inner, stream_id),
+        Frame::OpenError { stream_id, code } => handle_open_error(inner, stream_id, code).await,
         Frame::Data { stream_id, payload } => handle_data(inner, stream_id, payload).await,
         Frame::Fin { stream_id } => handle_fin(inner, stream_id),
         Frame::Reset { stream_id, code } => handle_reset(inner, stream_id, code).await,
@@ -1179,29 +1218,60 @@ async fn handle_datagram_open(
         .map_err(|_| "mux server datagram accept queue closed".to_string())
 }
 
-/// Resolves one locally pending OPEN response.
+/// Marks one locally opened stream ready without gating its early DATA.
 ///
-/// Example: OPEN_ERROR wakes the accepted yy TCP without affecting other streams.
-async fn complete_open(
+/// Example: OPEN_OK changes stream 1 from opening to open after client bytes already flowed.
+fn handle_open_ok(inner: &EndpointInner, stream_id: u32) -> Result<(), String> {
+    if inner.role != Role::Client {
+        return Err("invalid mux OPEN_OK for server endpoint".to_string());
+    }
+    let Some(state) = optional_stream_state(inner, stream_id) else {
+        // A crossed local RESET may legitimately remove the stream before late OPEN_OK arrives.
+        return Ok(());
+    };
+    state
+        .open_state
+        .compare_exchange(
+            STREAM_OPENING,
+            STREAM_OPEN,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map_err(|_| "unexpected mux OPEN_OK response".to_string())?;
+    Ok(())
+}
+
+/// Rejects one locally opened stream and orders RESET after all earlier DATA.
+///
+/// Example: OPEN_ERROR code 2 closes stream 1, restores credit, then confirms cleanup with RESET.
+async fn handle_open_error(
     inner: &Arc<EndpointInner>,
     stream_id: u32,
-    result: Result<(), String>,
+    code: u16,
 ) -> Result<(), String> {
-    let state = stream_state(inner, stream_id)?;
-    let sender = state
-        .open_result
-        .lock()
-        .expect("mux open result poisoned")
-        .take()
-        .ok_or_else(|| "unexpected mux OPEN response".to_string())?;
-    let failed = result.is_err();
-    let _ = sender.send(result);
-    if failed {
-        inner
-            .remove_stream(stream_id, "remote target open failed")
-            .await?;
+    if inner.role != Role::Client {
+        return Err("invalid mux OPEN_ERROR for server endpoint".to_string());
     }
-    Ok(())
+    let Some(state) = optional_stream_state(inner, stream_id) else {
+        // Crossed RESET and duplicate cleanup responses are harmless after local removal.
+        return Ok(());
+    };
+    state
+        .open_state
+        .compare_exchange(
+            STREAM_OPENING,
+            STREAM_REJECTED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map_err(|_| "unexpected mux OPEN_ERROR response".to_string())?;
+    inner
+        .remove_stream(stream_id, "remote target open failed")
+        .await?;
+    inner
+        .outbound
+        .send_control(Frame::Reset { stream_id, code })
+        .await
 }
 
 /// Resolves one locally pending UDP association response.

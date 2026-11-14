@@ -231,6 +231,104 @@ async fn data_waits_for_carrier_handoff_before_fin() {
     ));
 }
 
+/// Verifies ordered control completion proves actual carrier admission, not queue admission.
+///
+/// Example: a full one-frame carrier keeps OPEN pending until HELLO is drained.
+#[tokio::test]
+async fn ordered_control_waits_for_carrier_handoff() {
+    let (carrier, mut received) = tokio::sync::mpsc::channel(1);
+    let outbound = Outbound::start(carrier, Frame::Fin { stream_id: 0 });
+    time::sleep(Duration::from_millis(10)).await;
+
+    let sender = outbound.clone();
+    let ordered = tokio::spawn(async move {
+        sender
+            .send_ordered_control(Frame::Open {
+                stream_id: 1,
+                target_port: 10808,
+            })
+            .await
+    });
+    time::sleep(Duration::from_millis(10)).await;
+    assert!(!ordered.is_finished());
+    assert!(matches!(
+        received.recv().await,
+        Some(Frame::Fin { stream_id: 0 })
+    ));
+    ordered
+        .await
+        .expect("join ordered OPEN")
+        .expect("OPEN carrier handoff");
+    assert!(matches!(
+        received.recv().await,
+        Some(Frame::Open {
+            stream_id: 1,
+            target_port: 10808
+        })
+    ));
+}
+
+/// Verifies DATA started after ordered OPEN can never overtake that OPEN.
+///
+/// Example: even after a saturated control burst, stream 1 observes OPEN before DATA.
+#[tokio::test]
+async fn ordered_open_precedes_data_after_control_burst() {
+    let (carrier, mut received) = tokio::sync::mpsc::channel(1);
+    let outbound = Outbound::start(carrier, Frame::Fin { stream_id: 0 });
+    for stream_id in 10..10 + CONTROL_BURST_LIMIT as u32 {
+        outbound
+            .send_control(Frame::Fin { stream_id })
+            .await
+            .expect("queue control burst");
+    }
+    let open_sender = outbound.clone();
+    let open = tokio::spawn(async move {
+        open_sender
+            .send_ordered_control(Frame::Open {
+                stream_id: 1,
+                target_port: 10808,
+            })
+            .await
+    });
+
+    let mut saw_open = false;
+    while !saw_open {
+        saw_open = matches!(
+            received.recv().await.expect("receive pre-DATA frame"),
+            Frame::Open { stream_id: 1, .. }
+        );
+    }
+    open.await
+        .expect("join ordered OPEN")
+        .expect("OPEN carrier handoff");
+    let data = tokio::spawn(send_data(outbound, Bytes::from_static(b"early")));
+    assert!(matches!(
+        received.recv().await,
+        Some(Frame::Data { stream_id: 1, .. })
+    ));
+    data.await
+        .expect("join post-OPEN DATA")
+        .expect("DATA carrier handoff");
+}
+
+/// Verifies carrier closure explicitly fails an ordered control waiter.
+///
+/// Example: dropping the receiver makes a pending OPEN return an error instead of hanging.
+#[tokio::test]
+async fn carrier_close_fails_ordered_control() {
+    let (carrier, received) = tokio::sync::mpsc::channel(1);
+    let outbound = Outbound::start(carrier, Frame::Fin { stream_id: 0 });
+    time::sleep(Duration::from_millis(10)).await;
+    drop(received);
+    assert!(outbound
+        .send_ordered_control(Frame::Open {
+            stream_id: 1,
+            target_port: 10808,
+        })
+        .await
+        .is_err());
+}
+
 /// Verifies an endless control producer cannot permanently starve pending DATA.
 ///
 /// Example: DATA appears no later than one configured control burst.

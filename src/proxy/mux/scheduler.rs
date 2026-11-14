@@ -22,11 +22,21 @@ const CONTROL_BURST_LIMIT: usize = 32;
 #[derive(Clone)]
 pub(super) struct Outbound {
     /// High-priority lifecycle and window frame queue.
-    control: mpsc::Sender<Frame>,
+    control: mpsc::Sender<ControlCommand>,
     /// Per-stream DATA lifecycle events consumed by the fair scheduler.
     data: mpsc::Sender<DataEvent>,
     /// Lossy UDP packet queue that cannot occupy lifecycle control capacity.
     datagram: mpsc::Sender<Frame>,
+}
+
+/// One control frame optionally acknowledging its carrier handoff.
+///
+/// Example: OPEN waits for `delivered`, while WINDOW_UPDATE only uses queue admission.
+struct ControlCommand {
+    /// Lifecycle or window frame sent through the ordered carrier.
+    frame: Frame,
+    /// Optional completion proving this frame reached the carrier before later DATA.
+    delivered: Option<oneshot::Sender<Result<(), String>>>,
 }
 
 /// DATA frame retained until the shared carrier accepts it.
@@ -92,7 +102,10 @@ impl Outbound {
         let (data, data_rx) = mpsc::channel(DATA_QUEUE_CAPACITY);
         let (datagram, datagram_rx) = mpsc::channel(DATAGRAM_QUEUE_CAPACITY);
         control
-            .try_send(initial)
+            .try_send(ControlCommand {
+                frame: initial,
+                delivered: None,
+            })
             .expect("fresh mux control queue must accept hello");
         tokio::spawn(run_scheduler(carrier, control_rx, data_rx, datagram_rx));
         Self {
@@ -107,9 +120,29 @@ impl Outbound {
     /// Example: a zero-window stream can still send RESET and WINDOW_UPDATE.
     pub(super) async fn send_control(&self, frame: Frame) -> Result<(), String> {
         self.control
-            .send(frame)
+            .send(ControlCommand {
+                frame,
+                delivered: None,
+            })
             .await
             .map_err(|_| "mux control scheduler closed".to_string())
+    }
+
+    /// Sends one ordered control frame and waits until the carrier accepts it.
+    ///
+    /// Example: OPEN completes before its stream may enqueue DATA, preventing DATA/OPEN inversion.
+    pub(super) async fn send_ordered_control(&self, frame: Frame) -> Result<(), String> {
+        let (delivered, result) = oneshot::channel();
+        self.control
+            .send(ControlCommand {
+                frame,
+                delivered: Some(delivered),
+            })
+            .await
+            .map_err(|_| "mux control scheduler closed".to_string())?;
+        result
+            .await
+            .map_err(|_| "mux control carrier handoff cancelled".to_string())?
     }
 
     /// Attempts one unordered UDP frame without waiting behind a congested carrier.
@@ -284,7 +317,7 @@ impl FairQueue {
 /// Example: thirty-two WINDOW_UPDATE frames may precede DATA, but the thirty-third cannot.
 async fn run_scheduler(
     carrier: mpsc::Sender<Frame>,
-    mut control: mpsc::Receiver<Frame>,
+    mut control: mpsc::Receiver<ControlCommand>,
     mut data: mpsc::Receiver<DataEvent>,
     mut datagram: mpsc::Receiver<Frame>,
 ) {
@@ -300,8 +333,8 @@ async fn run_scheduler(
         }
 
         if consecutive_control < CONTROL_BURST_LIMIT {
-            if let Ok(frame) = control.try_recv() {
-                if carrier.send(frame).await.is_err() {
+            if let Ok(command) = control.try_recv() {
+                if send_control_to_carrier(&carrier, command).await.is_err() {
                     fair.fail_pending("mux carrier closed");
                     return;
                 }
@@ -352,8 +385,8 @@ async fn run_scheduler(
             continue;
         }
 
-        if let Ok(frame) = control.try_recv() {
-            if carrier.send(frame).await.is_err() {
+        if let Ok(command) = control.try_recv() {
+            if send_control_to_carrier(&carrier, command).await.is_err() {
                 fair.fail_pending("mux carrier closed");
                 return;
             }
@@ -370,9 +403,9 @@ async fn run_scheduler(
                 Some(event) => fair.apply(event),
                 None => data_closed = true,
             },
-            frame = control.recv(), if !control_closed => match frame {
-                Some(frame) => {
-                    if carrier.send(frame).await.is_err() {
+            command = control.recv(), if !control_closed => match command {
+                Some(command) => {
+                    if send_control_to_carrier(&carrier, command).await.is_err() {
                         fair.fail_pending("mux carrier closed");
                         return;
                     }
@@ -393,6 +426,23 @@ async fn run_scheduler(
             },
         }
     }
+}
+
+/// Hands one control frame to the carrier and resolves its optional ordering proof.
+///
+/// Example: successful OPEN handoff wakes `Endpoint::open`; carrier closure returns an error.
+async fn send_control_to_carrier(
+    carrier: &mpsc::Sender<Frame>,
+    command: ControlCommand,
+) -> Result<(), String> {
+    let result = carrier
+        .send(command.frame)
+        .await
+        .map_err(|_| "mux carrier closed".to_string());
+    if let Some(delivered) = command.delivered {
+        let _ = delivered.send(result.clone());
+    }
+    result
 }
 
 #[cfg(test)]
