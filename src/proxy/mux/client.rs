@@ -10,7 +10,7 @@ use url::Url;
 use crate::{endpoint, proxy::websocket, target_proxy};
 
 use super::{
-    bridge::bridge_tcp,
+    bridge::{bridge_tcp, bridge_tcp_prefixed},
     core::{Config, Datagram, Endpoint, Role},
     protocol::{decode, encode, Frame},
     socks,
@@ -57,12 +57,15 @@ impl Client {
     ///
     /// Example: URL query `port=10808` becomes OPEN target port 10808.
     pub(crate) async fn handle_tcp(&self, tcp: TcpStream) -> Result<(), String> {
-        let is_socks5 = socks::is_socks5(&tcp).await?;
         let stream = self.open_stream().await?;
-        if is_socks5 {
-            socks::handle(tcp, stream, self).await
-        } else {
-            bridge_tcp(tcp, stream).await
+        match socks::classify(&tcp, &stream).await? {
+            socks::InitialFlow::Socks5 => socks::handle(tcp, stream, self).await,
+            socks::InitialFlow::Raw { remote_prefix } if remote_prefix.is_empty() => {
+                bridge_tcp(tcp, stream).await
+            }
+            socks::InitialFlow::Raw { remote_prefix } => {
+                bridge_tcp_prefixed(tcp, stream, remote_prefix).await
+            }
         }
     }
 

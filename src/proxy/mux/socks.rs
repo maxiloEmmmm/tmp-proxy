@@ -53,16 +53,39 @@ struct MuxControl {
     buffered: BytesMut,
 }
 
-/// Detects SOCKS5 without consuming bytes needed by the transparent HTTP path.
+/// Initial direction and protocol selected without consuming adjacent TCP bytes.
 ///
-/// Example: first byte `0x05 -> true`; ASCII `C` from CONNECT -> false.
-pub(super) async fn is_socks5(tcp: &TcpStream) -> Result<bool, String> {
+/// Example: local `0x05` selects SOCKS5; an SSH banner selects raw forwarding.
+pub(super) enum InitialFlow {
+    /// Client-first SOCKS5 traffic requiring UDP ASSOCIATE mediation.
+    Socks5,
+    /// Opaque TCP, optionally beginning with bytes already received from the target.
+    Raw {
+        /// Target bytes removed from the mux queue during direction detection.
+        remote_prefix: Bytes,
+    },
+}
+
+/// Detects SOCKS5 while allowing server-first raw protocols to make progress.
+///
+/// Example: SSH target banner arriving before client data immediately selects raw TCP.
+pub(super) async fn classify(tcp: &TcpStream, stream: &Stream) -> Result<InitialFlow, String> {
     let mut byte = [0_u8; 1];
-    let read = tcp
-        .peek(&mut byte)
-        .await
-        .map_err(|error| format!("peek yy tcp protocol failed: {error}"))?;
-    Ok(read == 1 && byte[0] == SOCKS5_VERSION)
+    tokio::select! {
+        local = tcp.peek(&mut byte) => {
+            let read = local.map_err(|error| format!("peek yy tcp protocol failed: {error}"))?;
+            if read == 1 && byte[0] == SOCKS5_VERSION {
+                Ok(InitialFlow::Socks5)
+            } else {
+                Ok(InitialFlow::Raw { remote_prefix: Bytes::new() })
+            }
+        }
+        remote = stream.recv_chunk() => {
+            let remote_prefix = remote
+                .ok_or_else(|| "mux target closed before protocol detection".to_string())?;
+            Ok(InitialFlow::Raw { remote_prefix })
+        }
+    }
 }
 
 /// Relays SOCKS5 TCP unchanged and maps UDP ASSOCIATE onto one mux datagram.
@@ -79,9 +102,9 @@ pub(super) async fn handle(
         .ip();
     let mut remote = MuxControl::new(stream);
     let negotiation = async {
-        relay_no_auth(&mut tcp, &mut remote).await?;
+        accept_no_auth(&mut tcp).await?;
         let request = read_request(&mut tcp).await?;
-        remote.send_all(&request.raw).await?;
+        open_remote_socks(&mut remote, &request.raw).await?;
         let reply = read_reply(&mut remote).await?;
         Ok::<_, String>((request, reply))
     }
@@ -153,27 +176,37 @@ pub(super) async fn handle(
     bridge_udp(tcp, udp, datagram, remote).await
 }
 
-/// Transparently relays the controlled no-authentication negotiation.
+/// Completes controlled no-authentication locally without spending a WAN round trip.
 ///
-/// Example: `[5,1,0] <-> [5,0]` completes before reading the command.
-async fn relay_no_auth(tcp: &mut TcpStream, remote: &mut MuxControl) -> Result<(), String> {
+/// Example: client `[5,1,0]` receives `[5,0]` directly from yy.
+async fn accept_no_auth(tcp: &mut TcpStream) -> Result<(), String> {
     let header = read_tcp_exact(tcp, 2, "SOCKS5 greeting header").await?;
     if header[0] != SOCKS5_VERSION || header[1] == 0 {
         return Err("invalid SOCKS5 greeting".to_string());
     }
     let methods = read_tcp_exact(tcp, header[1] as usize, "SOCKS5 methods").await?;
-    let mut greeting = BytesMut::with_capacity(2 + methods.len());
-    greeting.extend_from_slice(&header);
-    greeting.extend_from_slice(&methods);
-    remote.send_all(&greeting).await?;
-
-    let selection = remote.read_exact(2).await?;
-    tcp.write_all(&selection)
+    if !methods.contains(&0) {
+        tcp.write_all(&[SOCKS5_VERSION, 0xff])
+            .await
+            .map_err(|error| format!("reject SOCKS5 methods failed: {error}"))?;
+        return Err("SOCKS5 client did not offer no-authentication".to_string());
+    }
+    tcp.write_all(&[SOCKS5_VERSION, 0])
         .await
-        .map_err(|error| format!("write SOCKS5 method selection failed: {error}"))?;
-    // 两端配置都由我们控制，只允许 NO AUTH，避免在转发层复制认证状态机。
+        .map_err(|error| format!("accept SOCKS5 no-authentication failed: {error}"))
+}
+
+/// Pipelines daemon-side greeting and request into one mux DATA exchange.
+///
+/// Example: `[5,1,0] + CONNECT` lets B sing-box answer without a second WAN request.
+async fn open_remote_socks(remote: &mut MuxControl, request: &[u8]) -> Result<(), String> {
+    let mut pipelined = BytesMut::with_capacity(3 + request.len());
+    pipelined.extend_from_slice(&[SOCKS5_VERSION, 1, 0]);
+    pipelined.extend_from_slice(request);
+    remote.send_all(&pipelined).await?;
+    let selection = remote.read_exact(2).await?;
     if selection.as_ref() != [SOCKS5_VERSION, 0] {
-        return Err("SOCKS5 no-authentication method was not selected".to_string());
+        return Err("daemon-side SOCKS5 rejected no-authentication".to_string());
     }
     Ok(())
 }

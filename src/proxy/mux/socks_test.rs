@@ -2,13 +2,16 @@ use std::{net::SocketAddr, time::Duration};
 
 use bytes::Bytes;
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::mpsc,
     time,
 };
 
-use super::{bridge_udp, is_socks5, read_reply, read_request, success_reply, MuxControl};
+use super::{
+    accept_no_auth, bridge_udp, classify, open_remote_socks, read_reply, read_request,
+    success_reply, InitialFlow, MuxControl,
+};
 use crate::proxy::mux::core::{Config, Datagram, Endpoint, Role, Stream};
 
 /// Creates one connected TCP pair without involving the operating proxy services.
@@ -78,11 +81,95 @@ async fn datagram_pair(client: &Endpoint, server: &Endpoint) -> (Datagram, Datag
 #[tokio::test]
 async fn detection_preserves_first_byte() {
     let (yy, mut client) = tcp_pair().await;
+    let (client_endpoint, server_endpoint) = peer_pair();
+    let (local, _remote) = stream_pair(&client_endpoint, &server_endpoint).await;
     client.write_all(&[5]).await.expect("write SOCKS5 byte");
-    assert!(is_socks5(&yy).await.expect("detect SOCKS5"));
+    assert!(matches!(
+        classify(&yy, &local).await.expect("detect SOCKS5"),
+        InitialFlow::Socks5
+    ));
     let mut observed = [0_u8; 1];
     yy.try_read(&mut observed).expect("read preserved byte");
     assert_eq!(observed, [5]);
+}
+
+/// Verifies a server-first target bypasses SOCKS5 detection without waiting for the client.
+///
+/// Example: an SSH banner received first becomes the raw bridge prefix.
+#[tokio::test]
+async fn server_first_banner_selects_raw_flow() {
+    let (yy, _client) = tcp_pair().await;
+    let (client_endpoint, server_endpoint) = peer_pair();
+    let (local, remote) = stream_pair(&client_endpoint, &server_endpoint).await;
+    remote
+        .reserve_send()
+        .await
+        .expect("reserve banner")
+        .send(Bytes::from_static(b"SSH-2.0-test\r\n"))
+        .await
+        .expect("send banner");
+    let flow = classify(&yy, &local)
+        .await
+        .expect("classify server-first flow");
+    match flow {
+        InitialFlow::Raw { remote_prefix } => {
+            assert_eq!(&remote_prefix[..], b"SSH-2.0-test\r\n");
+        }
+        InitialFlow::Socks5 => panic!("server-first flow misclassified as SOCKS5"),
+    }
+}
+
+/// Verifies NO AUTH is completed locally before any daemon-side SOCKS5 response.
+///
+/// Example: `[5,1,0]` immediately receives `[5,0]` on the adjacent TCP pair.
+#[tokio::test]
+async fn no_authentication_is_answered_locally() {
+    let (mut yy, mut client) = tcp_pair().await;
+    client
+        .write_all(&[5, 1, 0])
+        .await
+        .expect("write no-auth greeting");
+    accept_no_auth(&mut yy).await.expect("accept no-auth");
+    let mut selection = [0_u8; 2];
+    client
+        .read_exact(&mut selection)
+        .await
+        .expect("read local method selection");
+    assert_eq!(selection, [5, 0]);
+}
+
+/// Verifies the daemon receives greeting and CONNECT in one DATA exchange.
+///
+/// Example: `[5,1,0] + request` reaches B before yy waits for method selection.
+#[tokio::test]
+async fn daemon_greeting_and_request_are_pipelined() {
+    let (client_endpoint, server_endpoint) = peer_pair();
+    let (local, remote) = stream_pair(&client_endpoint, &server_endpoint).await;
+    let request = Bytes::from_static(&[5, 1, 0, 1, 127, 0, 0, 1, 0, 22]);
+    let task = tokio::spawn(async move {
+        let mut control = MuxControl::new(local);
+        open_remote_socks(&mut control, &request).await
+    });
+
+    let pipelined = remote
+        .recv_chunk()
+        .await
+        .expect("receive pipelined request");
+    assert_eq!(&pipelined[..], &[5, 1, 0, 5, 1, 0, 1, 127, 0, 0, 1, 0, 22]);
+    remote
+        .consumed(pipelined.len())
+        .await
+        .expect("consume pipelined request");
+    remote
+        .reserve_send()
+        .await
+        .expect("reserve method selection")
+        .send(Bytes::from_static(&[5, 0]))
+        .await
+        .expect("send method selection");
+    task.await
+        .expect("join remote SOCKS open")
+        .expect("complete remote SOCKS open");
 }
 
 /// Verifies a fragmented domain-form UDP ASSOCIATE is reassembled exactly.
