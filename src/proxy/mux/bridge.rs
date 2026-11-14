@@ -1,6 +1,6 @@
 use std::io::ErrorKind;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use futures_util::FutureExt;
 use tokio::{io::AsyncWriteExt, net::tcp::OwnedReadHalf, net::TcpStream};
 
@@ -10,6 +10,17 @@ use super::core::{Stream, RESET_LOCAL_IO};
 ///
 /// Example: yy passes its sing-box TCP; daemon passes its target TCP.
 pub(super) async fn bridge_tcp(tcp: TcpStream, stream: Stream) -> Result<(), String> {
+    bridge_tcp_prefixed(tcp, stream, Bytes::new()).await
+}
+
+/// Bridges TCP after protocol inspection while preserving already received target bytes.
+///
+/// Example: a SOCKS5 success and an immediate server banner keep the banner intact.
+pub(super) async fn bridge_tcp_prefixed(
+    tcp: TcpStream,
+    stream: Stream,
+    remote_prefix: Bytes,
+) -> Result<(), String> {
     let (tcp_reader, mut tcp_writer) = tcp.into_split();
     let upload = async {
         let mut scheduler_active = false;
@@ -40,6 +51,13 @@ pub(super) async fn bridge_tcp(tcp: TcpStream, stream: Stream) -> Result<(), Str
         }
     };
     let download = async {
+        if !remote_prefix.is_empty() {
+            tcp_writer
+                .write_all(&remote_prefix)
+                .await
+                .map_err(|error| format!("write inspected tcp prefix failed: {error}"))?;
+            stream.consumed(remote_prefix.len()).await?;
+        }
         while let Some(payload) = stream.recv_chunk().await {
             tcp_writer
                 .write_all(&payload)

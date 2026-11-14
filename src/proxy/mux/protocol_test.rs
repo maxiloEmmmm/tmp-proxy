@@ -38,6 +38,20 @@ fn frame_round_trips() {
             increment: 512,
         },
         Frame::ConnectionWindowUpdate { increment: 1024 },
+        Frame::DatagramOpen {
+            association_id: 3,
+            target_port: 10808,
+        },
+        Frame::DatagramOpenOk { association_id: 3 },
+        Frame::DatagramOpenError {
+            association_id: 3,
+            code: 4,
+        },
+        Frame::Datagram {
+            association_id: 3,
+            payload: Bytes::from_static(b"opaque"),
+        },
+        Frame::DatagramClose { association_id: 3 },
     ];
 
     for frame in frames {
@@ -53,4 +67,5 @@ fn invalid_frames_are_rejected() {
     assert!(decode(Bytes::from_static(&[1, 0])).is_err());
     assert!(decode(Bytes::from_static(&[8, 0, 0, 0, 1, 0, 0, 0, 0])).is_err());
     assert!(decode(Bytes::from_static(&[5, 0, 0, 0, 0, 1])).is_err());
+    assert!(decode(Bytes::from_static(&[13, 0, 0, 0, 3])).is_err());
 }

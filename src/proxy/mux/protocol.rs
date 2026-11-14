@@ -74,6 +74,37 @@ pub(super) enum Frame {
         /// Number of newly available bytes.
         increment: u32,
     },
+    /// Opens one unordered UDP datagram association.
+    DatagramOpen {
+        /// Association identifier allocated by the opener.
+        association_id: u32,
+        /// Fixed daemon-side UDP access port selected for the association.
+        target_port: u16,
+    },
+    /// Confirms that a UDP datagram association is ready.
+    DatagramOpenOk {
+        /// Association identifier being confirmed.
+        association_id: u32,
+    },
+    /// Rejects a UDP datagram association.
+    DatagramOpenError {
+        /// Association identifier being rejected.
+        association_id: u32,
+        /// Stable machine-readable failure code.
+        code: u16,
+    },
+    /// Carries one complete UDP datagram without stream semantics.
+    Datagram {
+        /// Association receiving this datagram.
+        association_id: u32,
+        /// Opaque datagram payload whose boundary must be preserved.
+        payload: Bytes,
+    },
+    /// Closes one UDP datagram association.
+    DatagramClose {
+        /// Association identifier being closed.
+        association_id: u32,
+    },
 }
 
 /// Encodes one mux frame into one WebSocket binary message.
@@ -118,6 +149,28 @@ pub(super) fn encode(frame: Frame) -> Bytes {
             increment,
         } => encode_increment_frame(8, stream_id, increment),
         Frame::ConnectionWindowUpdate { increment } => encode_increment_frame(9, 0, increment),
+        Frame::DatagramOpen {
+            association_id,
+            target_port,
+        } => {
+            let mut output = frame_header(10, association_id, 2);
+            output.put_u16(target_port);
+            output.freeze()
+        }
+        Frame::DatagramOpenOk { association_id } => frame_header(11, association_id, 0).freeze(),
+        Frame::DatagramOpenError {
+            association_id,
+            code,
+        } => encode_code_frame(12, association_id, code),
+        Frame::Datagram {
+            association_id,
+            payload,
+        } => {
+            let mut output = frame_header(13, association_id, payload.len());
+            output.extend_from_slice(&payload);
+            output.freeze()
+        }
+        Frame::DatagramClose { association_id } => frame_header(14, association_id, 0).freeze(),
     }
 }
 
@@ -144,10 +197,38 @@ pub(super) fn decode(input: Bytes) -> Result<Frame, String> {
         7 if stream_id != 0 => decode_code(stream_id, &payload, false),
         8 if stream_id != 0 => decode_increment(stream_id, &payload),
         9 if stream_id == 0 => decode_connection_increment(&payload),
+        10 if stream_id != 0 && payload.len() == 2 => Ok(Frame::DatagramOpen {
+            association_id: stream_id,
+            target_port: u16::from_be_bytes([payload[0], payload[1]]),
+        }),
+        11 if stream_id != 0 && payload.is_empty() => Ok(Frame::DatagramOpenOk {
+            association_id: stream_id,
+        }),
+        12 if stream_id != 0 => decode_datagram_open_error(stream_id, &payload),
+        13 if stream_id != 0 && !payload.is_empty() => Ok(Frame::Datagram {
+            association_id: stream_id,
+            payload,
+        }),
+        14 if stream_id != 0 && payload.is_empty() => Ok(Frame::DatagramClose {
+            association_id: stream_id,
+        }),
         _ => Err(format!(
             "invalid mux frame opcode={opcode} stream_id={stream_id}"
         )),
     }
+}
+
+/// Decodes one UDP association rejection without sharing TCP-specific naming.
+///
+/// Example: association 3 plus code 2 becomes `DatagramOpenError`.
+fn decode_datagram_open_error(association_id: u32, payload: &[u8]) -> Result<Frame, String> {
+    if payload.len() != 2 {
+        return Err("invalid mux datagram open error frame".to_string());
+    }
+    Ok(Frame::DatagramOpenError {
+        association_id,
+        code: u16::from_be_bytes([payload[0], payload[1]]),
+    })
 }
 
 /// Creates a common frame header with enough space for its payload.

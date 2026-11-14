@@ -11,8 +11,9 @@ use crate::{endpoint, proxy::websocket, target_proxy};
 
 use super::{
     bridge::bridge_tcp,
-    core::{Config, Endpoint, Role},
+    core::{Config, Datagram, Endpoint, Role},
     protocol::{decode, encode, Frame},
+    socks,
 };
 
 /// Capacity between the mux core and concrete WebSocket adapter.
@@ -56,14 +57,42 @@ impl Client {
     ///
     /// Example: URL query `port=10808` becomes OPEN target port 10808.
     pub(crate) async fn handle_tcp(&self, tcp: TcpStream) -> Result<(), String> {
+        let is_socks5 = socks::is_socks5(&tcp).await?;
+        let stream = self.open_stream().await?;
+        if is_socks5 {
+            socks::handle(tcp, stream, self).await
+        } else {
+            bridge_tcp(tcp, stream).await
+        }
+    }
+
+    /// Opens one unordered association for a SOCKS5 server-selected UDP relay port.
+    ///
+    /// Example: relay port 53001 is reached on the daemon-side configured host.
+    pub(super) async fn open_datagram(&self, target_port: u16) -> Result<Datagram, String> {
+        let (session, _) = self.session().await?;
+        match session.open_datagram(target_port).await {
+            Ok(datagram) => Ok(datagram),
+            Err(_) if session.is_closed() => {
+                self.clear_closed_session().await;
+                let (replacement, _) = self.session().await?;
+                replacement.open_datagram(target_port).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Opens the configured daemon-side TCP target with one stale-session retry.
+    ///
+    /// Example: a dead carrier is replaced before HTTP or SOCKS5 bytes are consumed.
+    async fn open_stream(&self) -> Result<super::core::Stream, String> {
         let (session, target_port) = self.session().await?;
         match session.open(target_port).await {
-            Ok(stream) => bridge_tcp(tcp, stream).await,
+            Ok(stream) => Ok(stream),
             Err(_) if session.is_closed() => {
                 self.clear_closed_session().await;
                 let (replacement, target_port) = self.session().await?;
-                let stream = replacement.open(target_port).await?;
-                bridge_tcp(tcp, stream).await
+                replacement.open(target_port).await
             }
             Err(error) => Err(error),
         }

@@ -59,6 +59,148 @@ async fn open_stream_pair(client: &Endpoint, server: &Endpoint) -> (super::Strea
     (client_stream, server_stream)
 }
 
+/// Opens one datagram association only after the server acknowledges it.
+///
+/// Example: association id 1 becomes usable by both peers after OPEN_OK.
+async fn open_datagram_pair(
+    client: &Endpoint,
+    server: &Endpoint,
+) -> (super::Datagram, super::Datagram) {
+    let opening_client = client.clone();
+    let open = tokio::spawn(async move { opening_client.open_datagram(10808).await });
+    let incoming = server
+        .accept_datagram()
+        .await
+        .expect("accept datagram OPEN");
+    assert_eq!(incoming.target_port(), 10808);
+    let server_datagram = incoming.accept().await.expect("acknowledge datagram OPEN");
+    let client_datagram = open
+        .await
+        .expect("join datagram OPEN")
+        .expect("datagram OPEN_OK");
+    assert_eq!(client_datagram.id(), server_datagram.id());
+    (client_datagram, server_datagram)
+}
+
+/// Verifies UDP datagrams retain boundaries and association isolation.
+///
+/// Example: two associations may reuse one carrier without receiving each other's packets.
+#[tokio::test]
+async fn datagrams_transfer_bidirectionally_without_cross_talk() {
+    let (client, server) = peer_pair(Config::default());
+    let (client_one, server_one) = open_datagram_pair(&client, &server).await;
+    let (client_two, server_two) = open_datagram_pair(&client, &server).await;
+
+    assert!(client_one
+        .send(Bytes::from_static(b"one"))
+        .await
+        .expect("send first datagram"));
+    assert!(client_two
+        .send(Bytes::from_static(b"two"))
+        .await
+        .expect("send second datagram"));
+    let one = server_one.recv().await.expect("receive first datagram");
+    let two = server_two.recv().await.expect("receive second datagram");
+    assert_eq!(&one[..], b"one");
+    assert_eq!(&two[..], b"two");
+
+    assert!(server_one
+        .send(Bytes::from_static(b"reply"))
+        .await
+        .expect("send datagram reply"));
+    let reply = client_one.recv().await.expect("receive datagram reply");
+    assert_eq!(&reply[..], b"reply");
+}
+
+/// Verifies closing one association leaves sibling associations and TCP streams usable.
+///
+/// Example: association 1 closes while association 3 still transfers one packet.
+#[tokio::test]
+async fn datagram_close_isolated_from_sibling_traffic() {
+    let (client, server) = peer_pair(Config::default());
+    let (client_one, server_one) = open_datagram_pair(&client, &server).await;
+    let (client_two, server_two) = open_datagram_pair(&client, &server).await;
+
+    client_one.close().await.expect("close first association");
+    assert!(time::timeout(Duration::from_secs(1), server_one.recv())
+        .await
+        .expect("remote close propagated")
+        .is_none());
+    assert!(client_two
+        .send(Bytes::from_static(b"alive"))
+        .await
+        .expect("send on sibling association"));
+    assert_eq!(
+        &server_two.recv().await.expect("receive sibling packet")[..],
+        b"alive"
+    );
+
+    let (client_stream, server_stream) = open_stream_pair(&client, &server).await;
+    client_stream
+        .reserve_send()
+        .await
+        .expect("reserve TCP after UDP close")
+        .send(Bytes::from_static(b"tcp"))
+        .await
+        .expect("send TCP after UDP close");
+    assert_eq!(
+        &server_stream.recv_chunk().await.expect("receive TCP")[..],
+        b"tcp"
+    );
+}
+
+/// Verifies one rejected association does not terminate the shared carrier.
+///
+/// Example: target failure for id 1 is followed by a successful id 3 association.
+#[tokio::test]
+async fn datagram_open_rejection_keeps_carrier_alive() {
+    let (client, server) = peer_pair(Config::default());
+    let opening_client = client.clone();
+    let rejected = tokio::spawn(async move { opening_client.open_datagram(10808).await });
+    server
+        .accept_datagram()
+        .await
+        .expect("accept rejected association")
+        .reject(2)
+        .await
+        .expect("reject association");
+    assert!(rejected.await.expect("join rejected open").is_err());
+
+    let (client_datagram, server_datagram) = open_datagram_pair(&client, &server).await;
+    assert!(client_datagram
+        .send(Bytes::from_static(b"next"))
+        .await
+        .expect("send after rejection"));
+    assert_eq!(
+        &server_datagram
+            .recv()
+            .await
+            .expect("receive after rejection")[..],
+        b"next"
+    );
+}
+
+/// Verifies oversized UDP input is rejected locally without poisoning the carrier.
+///
+/// Example: 65,508 bytes fail while a following small packet still transfers.
+#[tokio::test]
+async fn oversized_datagram_does_not_close_carrier() {
+    let (client, server) = peer_pair(Config::default());
+    let (client_datagram, server_datagram) = open_datagram_pair(&client, &server).await;
+    assert!(client_datagram
+        .send(Bytes::from(vec![0_u8; DEFAULT_MAX_FRAME as usize + 1]))
+        .await
+        .is_err());
+    assert!(client_datagram
+        .send(Bytes::from_static(b"small"))
+        .await
+        .expect("send valid packet"));
+    assert_eq!(
+        &server_datagram.recv().await.expect("receive valid packet")[..],
+        b"small"
+    );
+}
+
 /// Verifies bidirectional stream routing and explicit consumption accounting.
 ///
 /// Example: bytes sent by stream 1 arrive only at its paired stream 1.

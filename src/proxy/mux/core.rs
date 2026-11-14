@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify, Semaphore};
 
 use super::{
     protocol::{Frame, VERSION},
-    queue::ByteQueue,
+    queue::{ByteQueue, DatagramQueue},
     scheduler::Outbound,
     window::{RecvWindow, Reservation, SendWindow},
 };
@@ -22,14 +22,20 @@ pub(super) const DEFAULT_STREAM_WINDOW: u32 = 4 * 1024 * 1024;
 /// Aggregate receive window advertised by the default mux configuration.
 pub(super) const DEFAULT_CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
 
-/// Largest TCP chunk placed in one DATA frame.
-pub(super) const DEFAULT_MAX_FRAME: u32 = 32 * 1024;
+/// Largest payload placed in one DATA or DATAGRAM frame.
+pub(super) const DEFAULT_MAX_FRAME: u32 = 65_507;
 
 /// Maximum simultaneously registered logical streams.
 pub(super) const DEFAULT_MAX_STREAMS: u32 = 256;
 
 /// Receive consumption accumulated before returning window credit.
 const WINDOW_UPDATE_THRESHOLD: u32 = 64 * 1024;
+
+/// Maximum complete UDP packets retained for one association.
+const DATAGRAM_QUEUE_PACKETS: usize = 64;
+
+/// Maximum aggregate UDP payload retained for one association.
+const DATAGRAM_QUEUE_BYTES: usize = 128 * 1024;
 
 /// Stable reset code used when a local TCP bridge fails.
 pub(super) const RESET_LOCAL_IO: u16 = 1;
@@ -68,6 +74,8 @@ pub(super) struct Endpoint {
     inner: Arc<EndpointInner>,
     /// Server-side OPEN requests waiting for target connection handling.
     incoming: Arc<AsyncMutex<mpsc::Receiver<IncomingStream>>>,
+    /// Server-side UDP OPEN requests waiting for socket allocation.
+    incoming_datagrams: Arc<AsyncMutex<mpsc::Receiver<IncomingDatagram>>>,
 }
 
 /// Shared endpoint state used by the frame driver and logical stream handles.
@@ -80,6 +88,8 @@ struct EndpointInner {
     outbound: Outbound,
     /// Currently registered stream state by identifier.
     streams: Mutex<HashMap<u32, Arc<StreamState>>>,
+    /// Currently registered UDP association state by identifier.
+    datagrams: Mutex<HashMap<u32, Arc<DatagramState>>>,
     /// Remote hello limits and connection send window.
     remote: Mutex<Option<Arc<RemoteState>>>,
     /// Wakes open/accept operations after the remote hello arrives.
@@ -90,6 +100,8 @@ struct EndpointInner {
     recv_connection: Mutex<RecvWindow>,
     /// Server-side queue receiving validated OPEN requests.
     incoming: mpsc::Sender<IncomingStream>,
+    /// Server-side queue receiving validated UDP association requests.
+    incoming_datagrams: mpsc::Sender<IncomingDatagram>,
     /// Whether the carrier or protocol has terminated.
     closed: AtomicBool,
     /// Wakes operations waiting for a usable connection.
@@ -128,6 +140,20 @@ struct StreamState {
     closed_notify: Notify,
 }
 
+/// Shared state for one unordered UDP association.
+struct DatagramState {
+    /// Stable association identifier.
+    id: u32,
+    /// Bounded queue preserving individual incoming packets.
+    inbound: DatagramQueue,
+    /// Completion channel for a locally initiated association OPEN.
+    open_result: Mutex<Option<oneshot::Sender<Result<(), String>>>>,
+    /// Whether CLOSE or carrier shutdown ended this association.
+    closed: AtomicBool,
+    /// Wakes receivers after association termination.
+    closed_notify: Notify,
+}
+
 /// Application-facing logical stream with explicit chunk consumption.
 ///
 /// Example: write adjacent TCP bytes with a send permit, then consume inbound bytes.
@@ -136,6 +162,16 @@ pub(super) struct Stream {
     endpoint: Weak<EndpointInner>,
     /// Shared logical stream state.
     state: Arc<StreamState>,
+}
+
+/// Application-facing unordered UDP association.
+///
+/// Example: one local UDP peer exchanges opaque datagrams through one shared carrier.
+pub(in crate::proxy) struct Datagram {
+    /// Owning endpoint used for frame emission and lifecycle.
+    endpoint: Weak<EndpointInner>,
+    /// Shared logical association state.
+    state: Arc<DatagramState>,
 }
 
 /// Credit reservation proving that adjacent TCP may be read for this stream.
@@ -164,6 +200,16 @@ pub(super) struct IncomingStream {
     target_port: u16,
     /// Logical stream pending acceptance.
     stream: Option<Stream>,
+}
+
+/// Server-side UDP association awaiting socket allocation.
+///
+/// Example: the daemon binds an ephemeral UDP socket before accepting it.
+pub(super) struct IncomingDatagram {
+    /// Fixed target port requested when this association was opened.
+    target_port: u16,
+    /// Logical association pending acceptance.
+    datagram: Option<Datagram>,
 }
 
 impl Default for Config {
@@ -202,11 +248,14 @@ impl Endpoint {
             },
         );
         let (incoming_tx, incoming_rx) = mpsc::channel(config.max_streams as usize);
+        let (incoming_datagram_tx, incoming_datagram_rx) =
+            mpsc::channel(config.max_streams as usize);
         let inner = Arc::new(EndpointInner {
             role,
             config,
             outbound,
             streams: Mutex::new(HashMap::new()),
+            datagrams: Mutex::new(HashMap::new()),
             remote: Mutex::new(None),
             hello_ready: Notify::new(),
             next_stream_id: AtomicU32::new(match role {
@@ -218,6 +267,7 @@ impl Endpoint {
                 WINDOW_UPDATE_THRESHOLD.min(config.connection_window),
             )?),
             incoming: incoming_tx,
+            incoming_datagrams: incoming_datagram_tx,
             closed: AtomicBool::new(false),
             closed_notify: Notify::new(),
         });
@@ -225,6 +275,7 @@ impl Endpoint {
         Ok(Self {
             inner,
             incoming: Arc::new(AsyncMutex::new(incoming_rx)),
+            incoming_datagrams: Arc::new(AsyncMutex::new(incoming_datagram_rx)),
         })
     }
 
@@ -267,6 +318,50 @@ impl Endpoint {
             .recv()
             .await
             .ok_or_else(|| "mux incoming stream queue closed".to_string())
+    }
+
+    /// Opens one client-initiated UDP association and waits for remote readiness.
+    ///
+    /// Example: target port 10808 returns an association only after DATAGRAM_OPEN_OK.
+    pub(super) async fn open_datagram(&self, target_port: u16) -> Result<Datagram, String> {
+        if self.inner.role != Role::Client {
+            return Err("invalid mux client datagram open request".to_string());
+        }
+        let remote = self.inner.wait_remote().await?;
+        let id = self.inner.allocate_stream_id(remote.max_streams)?;
+        let (state, datagram) = self.inner.create_datagram(id, true)?;
+        let (result_tx, result_rx) = oneshot::channel();
+        *state
+            .open_result
+            .lock()
+            .expect("mux datagram open result poisoned") = Some(result_tx);
+        self.inner
+            .outbound
+            .send_control(Frame::DatagramOpen {
+                association_id: id,
+                target_port,
+            })
+            .await?;
+        match result_rx.await {
+            Ok(Ok(())) => Ok(datagram),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err("mux datagram open was cancelled".to_string()),
+        }
+    }
+
+    /// Accepts the next server-side UDP association without acknowledging it prematurely.
+    ///
+    /// Example: the daemon connects its fixed target before accepting the association.
+    pub(super) async fn accept_datagram(&self) -> Result<IncomingDatagram, String> {
+        if self.inner.role != Role::Server {
+            return Err("mux client cannot accept remote datagrams".to_string());
+        }
+        self.incoming_datagrams
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or_else(|| "mux incoming datagram queue closed".to_string())
     }
 
     /// Reports whether the carrier or protocol has terminated.
@@ -316,7 +411,9 @@ impl EndpointInner {
     ///
     /// Example: the client allocates 1, 3, 5 without colliding with server IDs.
     fn allocate_stream_id(&self, remote_max_streams: u32) -> Result<u32, String> {
-        if self.streams.lock().expect("mux streams poisoned").len() >= remote_max_streams as usize {
+        let stream_count = self.streams.lock().expect("mux streams poisoned").len();
+        let datagram_count = self.datagrams.lock().expect("mux datagrams poisoned").len();
+        if stream_count.saturating_add(datagram_count) >= remote_max_streams as usize {
             return Err("mux remote stream limit reached".to_string());
         }
         let id = self.next_stream_id.fetch_add(2, Ordering::AcqRel);
@@ -349,17 +446,58 @@ impl EndpointInner {
             closed_notify: Notify::new(),
         });
         let mut streams = self.streams.lock().expect("mux streams poisoned");
-        if streams.contains_key(&id) {
+        let datagrams = self.datagrams.lock().expect("mux datagrams poisoned");
+        if streams.contains_key(&id) || datagrams.contains_key(&id) {
             return Err("duplicate mux stream identifier".to_string());
         }
-        if !local_open && streams.len() >= self.config.max_streams as usize {
+        if !local_open
+            && streams.len().saturating_add(datagrams.len()) >= self.config.max_streams as usize
+        {
             return Err("mux local stream limit reached".to_string());
         }
+        drop(datagrams);
         streams.insert(id, Arc::clone(&state));
         drop(streams);
         Ok((
             Arc::clone(&state),
             Stream {
+                endpoint: Arc::downgrade(self),
+                state,
+            },
+        ))
+    }
+
+    /// Creates and registers one bounded unordered datagram association.
+    ///
+    /// Example: a local open installs its result channel before DATAGRAM_OPEN is sent.
+    fn create_datagram(
+        self: &Arc<Self>,
+        id: u32,
+        local_open: bool,
+    ) -> Result<(Arc<DatagramState>, Datagram), String> {
+        let state = Arc::new(DatagramState {
+            id,
+            inbound: DatagramQueue::new(DATAGRAM_QUEUE_PACKETS, DATAGRAM_QUEUE_BYTES),
+            open_result: Mutex::new(None),
+            closed: AtomicBool::new(false),
+            closed_notify: Notify::new(),
+        });
+        let streams = self.streams.lock().expect("mux streams poisoned");
+        let mut datagrams = self.datagrams.lock().expect("mux datagrams poisoned");
+        if streams.contains_key(&id) || datagrams.contains_key(&id) {
+            return Err("duplicate mux association identifier".to_string());
+        }
+        if !local_open
+            && streams.len().saturating_add(datagrams.len()) >= self.config.max_streams as usize
+        {
+            return Err("mux local stream limit reached".to_string());
+        }
+        datagrams.insert(id, Arc::clone(&state));
+        drop(datagrams);
+        drop(streams);
+        Ok((
+            Arc::clone(&state),
+            Datagram {
                 endpoint: Arc::downgrade(self),
                 state,
             },
@@ -382,6 +520,16 @@ impl EndpointInner {
             .collect();
         for stream in streams {
             stream.close(reason);
+        }
+        let datagrams: Vec<_> = self
+            .datagrams
+            .lock()
+            .expect("mux datagrams poisoned")
+            .values()
+            .cloned()
+            .collect();
+        for datagram in datagrams {
+            datagram.close(reason);
         }
         if let Some(remote) = self
             .remote
@@ -432,6 +580,20 @@ impl EndpointInner {
         }
         Ok(())
     }
+
+    /// Removes one datagram association and wakes all blocked operations.
+    ///
+    /// Example: DATAGRAM_CLOSE releases its queue without affecting sibling streams.
+    fn remove_datagram(&self, association_id: u32, reason: &str) {
+        let state = self
+            .datagrams
+            .lock()
+            .expect("mux datagrams poisoned")
+            .remove(&association_id);
+        if let Some(state) = state {
+            state.close(reason);
+        }
+    }
 }
 
 impl StreamState {
@@ -448,6 +610,27 @@ impl StreamState {
             .open_result
             .lock()
             .expect("mux open result poisoned")
+            .take()
+        {
+            let _ = result.send(Err(reason.to_string()));
+        }
+        self.closed_notify.notify_waiters();
+    }
+}
+
+impl DatagramState {
+    /// Marks one association closed and releases its bounded packet queue.
+    ///
+    /// Example: carrier EOF wakes a receiver and resolves a pending open with an error.
+    fn close(&self, reason: &str) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.inbound.close();
+        if let Some(result) = self
+            .open_result
+            .lock()
+            .expect("mux datagram open result poisoned")
             .take()
         {
             let _ = result.send(Err(reason.to_string()));
@@ -620,6 +803,71 @@ impl Stream {
     }
 }
 
+impl Datagram {
+    /// Returns this association's stable identifier.
+    ///
+    /// Example: the first client association returns 1 when no stream preceded it.
+    pub(super) fn id(&self) -> u32 {
+        self.state.id
+    }
+
+    /// Attempts to send one complete opaque packet without blocking TCP progress.
+    ///
+    /// Example: carrier congestion returns `false` so only this packet is dropped.
+    pub(in crate::proxy) async fn send(&self, payload: Bytes) -> Result<bool, String> {
+        if payload.is_empty() {
+            return Err("mux datagram payload cannot be empty".to_string());
+        }
+        let endpoint = self
+            .endpoint
+            .upgrade()
+            .ok_or_else(|| "mux endpoint released".to_string())?;
+        if self.state.closed.load(Ordering::Acquire) {
+            return Err("mux datagram association closed".to_string());
+        }
+        let remote = endpoint.wait_remote().await?;
+        let maximum = endpoint.config.max_frame.min(remote.max_frame) as usize;
+        if payload.len() > maximum {
+            return Err("mux datagram exceeds remote frame limit".to_string());
+        }
+        endpoint.outbound.try_send_datagram(Frame::Datagram {
+            association_id: self.state.id,
+            payload,
+        })
+    }
+
+    /// Receives the next complete opaque packet while preserving its boundary.
+    ///
+    /// Example: two input packets produce two independent receive results.
+    pub(in crate::proxy) async fn recv(&self) -> Option<Bytes> {
+        if self.state.closed.load(Ordering::Acquire) {
+            return None;
+        }
+        tokio::select! {
+            biased;
+            _ = self.state.closed_notify.notified() => None,
+            packet = self.state.inbound.pop() => packet.map(|packet| packet.payload),
+        }
+    }
+
+    /// Closes one association locally and notifies its peer.
+    ///
+    /// Example: an expired local UDP peer releases only its own mux association.
+    pub(in crate::proxy) async fn close(&self) -> Result<(), String> {
+        let endpoint = self
+            .endpoint
+            .upgrade()
+            .ok_or_else(|| "mux endpoint released".to_string())?;
+        endpoint.remove_datagram(self.state.id, "local mux datagram close");
+        endpoint
+            .outbound
+            .send_control(Frame::DatagramClose {
+                association_id: self.state.id,
+            })
+            .await
+    }
+}
+
 impl SendPermit {
     /// Returns the exact upper bound for the next adjacent TCP read.
     ///
@@ -707,6 +955,58 @@ impl IncomingStream {
     }
 }
 
+impl IncomingDatagram {
+    /// Returns the fixed target port requested when the association was opened.
+    ///
+    /// Example: `10808` selects the daemon's configured host at UDP port 10808.
+    pub(super) fn target_port(&self) -> u16 {
+        self.target_port
+    }
+
+    /// Acknowledges target UDP socket readiness and returns the association.
+    ///
+    /// Example: the daemon connects its UDP socket before emitting DATAGRAM_OPEN_OK.
+    pub(super) async fn accept(mut self) -> Result<Datagram, String> {
+        let datagram = self
+            .datagram
+            .take()
+            .ok_or_else(|| "mux incoming datagram already resolved".to_string())?;
+        let endpoint = datagram
+            .endpoint
+            .upgrade()
+            .ok_or_else(|| "mux endpoint released".to_string())?;
+        endpoint
+            .outbound
+            .send_control(Frame::DatagramOpenOk {
+                association_id: datagram.id(),
+            })
+            .await?;
+        Ok(datagram)
+    }
+
+    /// Rejects one UDP association without terminating the shared carrier.
+    ///
+    /// Example: an unavailable target emits DATAGRAM_OPEN_ERROR for only this association.
+    pub(super) async fn reject(mut self, code: u16) -> Result<(), String> {
+        let datagram = self
+            .datagram
+            .take()
+            .ok_or_else(|| "mux incoming datagram already resolved".to_string())?;
+        let endpoint = datagram
+            .endpoint
+            .upgrade()
+            .ok_or_else(|| "mux endpoint released".to_string())?;
+        endpoint.remove_datagram(datagram.id(), "remote datagram target open failed");
+        endpoint
+            .outbound
+            .send_control(Frame::DatagramOpenError {
+                association_id: datagram.id(),
+                code,
+            })
+            .await
+    }
+}
+
 /// Validates local configuration before any driver task is started.
 ///
 /// Example: max frame larger than stream window is rejected.
@@ -773,6 +1073,31 @@ async fn handle_frame(inner: &Arc<EndpointInner>, frame: Frame) -> Result<(), St
             None => Ok(()),
         },
         Frame::ConnectionWindowUpdate { increment } => remote.send_connection.update(increment),
+        Frame::DatagramOpen {
+            association_id,
+            target_port,
+        } => handle_datagram_open(inner, association_id, target_port).await,
+        Frame::DatagramOpenOk { association_id } => {
+            complete_datagram_open(inner, association_id, Ok(()))
+        }
+        Frame::DatagramOpenError {
+            association_id,
+            code,
+        } => complete_datagram_open(
+            inner,
+            association_id,
+            Err(format!(
+                "remote datagram target open failed with code {code}"
+            )),
+        ),
+        Frame::Datagram {
+            association_id,
+            payload,
+        } => handle_datagram(inner, association_id, payload),
+        Frame::DatagramClose { association_id } => {
+            inner.remove_datagram(association_id, "remote mux datagram close");
+            Ok(())
+        }
         Frame::Hello { .. } => unreachable!("hello handled before match"),
     }
 }
@@ -832,6 +1157,28 @@ async fn handle_open(
         .map_err(|_| "mux server accept queue closed".to_string())
 }
 
+/// Creates one server-side pending UDP association from a valid open frame.
+///
+/// Example: odd association id 1 enters the daemon accept queue with its fixed port.
+async fn handle_datagram_open(
+    inner: &Arc<EndpointInner>,
+    association_id: u32,
+    target_port: u16,
+) -> Result<(), String> {
+    if inner.role != Role::Server || association_id % 2 == 0 {
+        return Err("invalid remote mux DATAGRAM_OPEN".to_string());
+    }
+    let (_, datagram) = inner.create_datagram(association_id, false)?;
+    inner
+        .incoming_datagrams
+        .send(IncomingDatagram {
+            target_port,
+            datagram: Some(datagram),
+        })
+        .await
+        .map_err(|_| "mux server datagram accept queue closed".to_string())
+}
+
 /// Resolves one locally pending OPEN response.
 ///
 /// Example: OPEN_ERROR wakes the accepted yy TCP without affecting other streams.
@@ -857,6 +1204,29 @@ async fn complete_open(
     Ok(())
 }
 
+/// Resolves one locally pending UDP association response.
+///
+/// Example: DATAGRAM_OPEN_ERROR removes only the rejected association.
+fn complete_datagram_open(
+    inner: &Arc<EndpointInner>,
+    association_id: u32,
+    result: Result<(), String>,
+) -> Result<(), String> {
+    let state = datagram_state(inner, association_id)?;
+    let sender = state
+        .open_result
+        .lock()
+        .expect("mux datagram open result poisoned")
+        .take()
+        .ok_or_else(|| "unexpected mux DATAGRAM_OPEN response".to_string())?;
+    let failed = result.is_err();
+    let _ = sender.send(result);
+    if failed {
+        inner.remove_datagram(association_id, "remote datagram target open failed");
+    }
+    Ok(())
+}
+
 /// Charges both receive windows and queues DATA until the adjacent TCP consumes it.
 ///
 /// Example: stalled targets cumulatively retain at most the aggregate connection window.
@@ -877,6 +1247,22 @@ async fn handle_data(inner: &EndpointInner, stream_id: u32, payload: Bytes) -> R
         .expect("mux connection receive window poisoned")
         .receive(bytes)?;
     state.inbound.push(&payload)?;
+    Ok(())
+}
+
+/// Queues one complete incoming UDP packet or drops it under local congestion.
+///
+/// Example: a full association queue drops one packet without blocking TCP DATA.
+fn handle_datagram(
+    inner: &EndpointInner,
+    association_id: u32,
+    payload: Bytes,
+) -> Result<(), String> {
+    if payload.is_empty() || payload.len() > inner.config.max_frame as usize {
+        return Err("mux datagram exceeds local frame limit".to_string());
+    }
+    let state = datagram_state(inner, association_id)?;
+    let _ = state.inbound.push(payload);
     Ok(())
 }
 
@@ -919,6 +1305,22 @@ fn optional_stream_state(inner: &EndpointInner, stream_id: u32) -> Option<Arc<St
         .expect("mux streams poisoned")
         .get(&stream_id)
         .cloned()
+}
+
+/// Looks up one active UDP association or returns a stable protocol error.
+///
+/// Example: a datagram for an unknown id is rejected rather than allocated implicitly.
+fn datagram_state(
+    inner: &EndpointInner,
+    association_id: u32,
+) -> Result<Arc<DatagramState>, String> {
+    inner
+        .datagrams
+        .lock()
+        .expect("mux datagrams poisoned")
+        .get(&association_id)
+        .cloned()
+        .ok_or_else(|| format!("unknown mux datagram association {association_id}"))
 }
 
 #[cfg(test)]

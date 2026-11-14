@@ -1,6 +1,6 @@
 use bytes::Bytes;
 
-use super::ByteQueue;
+use super::{ByteQueue, DatagramQueue};
 
 /// Verifies many tiny frames share one strict byte budget instead of frame slots.
 ///
@@ -39,4 +39,32 @@ async fn close_and_abort_have_distinct_drain_semantics() {
         .expect("push data");
     aborted.abort();
     assert!(aborted.pop(4).await.is_none());
+}
+
+/// Verifies UDP payloads preserve datagram boundaries and drop on bounded overflow.
+///
+/// Example: two queued packets remain separate while a third packet is discarded.
+#[tokio::test]
+async fn datagram_queue_preserves_boundaries_and_drops_overflow() {
+    let queue = DatagramQueue::new(2, 8);
+    assert!(queue.push(Bytes::from_static(b"one")));
+    assert!(queue.push(Bytes::from_static(b"two")));
+    assert!(!queue.push(Bytes::from_static(b"drop")));
+
+    let first = queue.pop().await.expect("first datagram");
+    let second = queue.pop().await.expect("second datagram");
+    assert_eq!(&first.payload[..], b"one");
+    assert_eq!(&second.payload[..], b"two");
+}
+
+/// Verifies closing a datagram queue discards retained packets and wakes receivers.
+///
+/// Example: one queued packet followed by close returns `None` immediately.
+#[tokio::test]
+async fn datagram_queue_close_discards_and_wakes() {
+    let queue = DatagramQueue::new(2, 8);
+    assert!(queue.push(Bytes::from_static(b"data")));
+    queue.close();
+    assert!(queue.pop().await.is_none());
+    assert!(!queue.push(Bytes::from_static(b"late")));
 }

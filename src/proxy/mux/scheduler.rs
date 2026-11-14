@@ -10,6 +10,9 @@ const CONTROL_QUEUE_CAPACITY: usize = 256;
 /// Capacity reserved for one pending DATA command per possible active stream.
 const DATA_QUEUE_CAPACITY: usize = 256;
 
+/// Capacity reserved for lossy UDP packets, isolated from lifecycle control.
+const DATAGRAM_QUEUE_CAPACITY: usize = 256;
+
 /// Maximum consecutive control frames before one ready DATA frame must progress.
 const CONTROL_BURST_LIMIT: usize = 32;
 
@@ -22,6 +25,8 @@ pub(super) struct Outbound {
     control: mpsc::Sender<Frame>,
     /// Per-stream DATA lifecycle events consumed by the fair scheduler.
     data: mpsc::Sender<DataEvent>,
+    /// Lossy UDP packet queue that cannot occupy lifecycle control capacity.
+    datagram: mpsc::Sender<Frame>,
 }
 
 /// DATA frame retained until the shared carrier accepts it.
@@ -85,11 +90,16 @@ impl Outbound {
     pub(super) fn start(carrier: mpsc::Sender<Frame>, initial: Frame) -> Self {
         let (control, control_rx) = mpsc::channel(CONTROL_QUEUE_CAPACITY);
         let (data, data_rx) = mpsc::channel(DATA_QUEUE_CAPACITY);
+        let (datagram, datagram_rx) = mpsc::channel(DATAGRAM_QUEUE_CAPACITY);
         control
             .try_send(initial)
             .expect("fresh mux control queue must accept hello");
-        tokio::spawn(run_scheduler(carrier, control_rx, data_rx));
-        Self { control, data }
+        tokio::spawn(run_scheduler(carrier, control_rx, data_rx, datagram_rx));
+        Self {
+            control,
+            data,
+            datagram,
+        }
     }
 
     /// Queues one lifecycle or window frame ahead of ordinary DATA.
@@ -100,6 +110,19 @@ impl Outbound {
             .send(frame)
             .await
             .map_err(|_| "mux control scheduler closed".to_string())
+    }
+
+    /// Attempts one unordered UDP frame without waiting behind a congested carrier.
+    ///
+    /// Example: a full bounded queue drops one packet while TCP DATA still progresses.
+    pub(super) fn try_send_datagram(&self, frame: Frame) -> Result<bool, String> {
+        match self.datagram.try_send(frame) {
+            Ok(()) => Ok(true),
+            Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err("mux control scheduler closed".to_string())
+            }
+        }
     }
 
     /// Queues one DATA frame and waits until the ordered carrier accepts it.
@@ -237,6 +260,13 @@ impl FairQueue {
         Some(command)
     }
 
+    /// Reports whether at least one TCP DATA command is ready for carrier service.
+    ///
+    /// Example: a ready DATA command limits UDP service to one packet before it progresses.
+    fn has_pending(&self) -> bool {
+        self.flows.values().any(|state| state.pending.is_some())
+    }
+
     /// Fails every pending DATA waiter after carrier shutdown.
     ///
     /// Example: WSS EOF wakes all streams instead of leaving carrier handoffs pending.
@@ -256,11 +286,14 @@ async fn run_scheduler(
     carrier: mpsc::Sender<Frame>,
     mut control: mpsc::Receiver<Frame>,
     mut data: mpsc::Receiver<DataEvent>,
+    mut datagram: mpsc::Receiver<Frame>,
 ) {
     let mut fair = FairQueue::new();
     let mut consecutive_control = 0usize;
     let mut control_closed = false;
     let mut data_closed = false;
+    let mut datagram_closed = false;
+    let mut datagram_since_data = false;
     loop {
         while let Ok(event) = data.try_recv() {
             fair.apply(event);
@@ -273,6 +306,18 @@ async fn run_scheduler(
                     return;
                 }
                 consecutive_control += 1;
+                continue;
+            }
+        }
+
+        if fair.has_pending() && !datagram_since_data {
+            if let Ok(frame) = datagram.try_recv() {
+                if carrier.send(frame).await.is_err() {
+                    fair.fail_pending("mux carrier closed");
+                    return;
+                }
+                datagram_since_data = true;
+                consecutive_control = 0;
                 continue;
             }
         }
@@ -293,6 +338,17 @@ async fn run_scheduler(
                 return;
             }
             consecutive_control = 0;
+            datagram_since_data = false;
+            continue;
+        }
+
+        if let Ok(frame) = datagram.try_recv() {
+            if carrier.send(frame).await.is_err() {
+                fair.fail_pending("mux carrier closed");
+                return;
+            }
+            datagram_since_data = true;
+            consecutive_control = 0;
             continue;
         }
 
@@ -305,7 +361,7 @@ async fn run_scheduler(
             continue;
         }
 
-        if control_closed && data_closed {
+        if control_closed && data_closed && datagram_closed {
             return;
         }
         tokio::select! {
@@ -323,6 +379,17 @@ async fn run_scheduler(
                     consecutive_control = consecutive_control.saturating_add(1);
                 }
                 None => control_closed = true,
+            },
+            frame = datagram.recv(), if !datagram_closed => match frame {
+                Some(frame) => {
+                    if carrier.send(frame).await.is_err() {
+                        fair.fail_pending("mux carrier closed");
+                        return;
+                    }
+                    datagram_since_data = true;
+                    consecutive_control = 0;
+                }
+                None => datagram_closed = true,
             },
         }
     }

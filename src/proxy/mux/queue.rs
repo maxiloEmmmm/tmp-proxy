@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::{collections::VecDeque, sync::Mutex};
 
 use bytes::{Bytes, BytesMut};
 use tokio::sync::Notify;
@@ -13,6 +13,38 @@ pub(super) struct ByteQueue {
     state: Mutex<QueueState>,
     /// Consumer wakeup after data or close transitions.
     readable: Notify,
+}
+
+/// One complete UDP packet retained by a datagram queue.
+///
+/// Example: one opaque UDP payload remains one indivisible item.
+pub(super) struct DatagramPacket {
+    /// Opaque UDP payload.
+    pub(super) payload: Bytes,
+}
+
+/// Packet- and byte-bounded queue that drops new UDP traffic under congestion.
+///
+/// Example: a full queue discards one datagram instead of blocking TCP streams.
+pub(super) struct DatagramQueue {
+    /// Maximum number of retained packet objects.
+    packet_capacity: usize,
+    /// Maximum aggregate payload bytes.
+    byte_capacity: usize,
+    /// Mutable datagram contents and lifecycle.
+    state: Mutex<DatagramQueueState>,
+    /// Consumer wakeup after data or close transitions.
+    readable: Notify,
+}
+
+/// Mutable UDP queue state guarded without holding a lock across await.
+struct DatagramQueueState {
+    /// Complete packets in arrival order.
+    packets: VecDeque<DatagramPacket>,
+    /// Aggregate payload bytes retained by `packets`.
+    bytes: usize,
+    /// Whether association closure prevents future packets.
+    closed: bool,
 }
 
 /// Mutable queue state guarded without holding a lock across await.
@@ -99,6 +131,77 @@ impl ByteQueue {
         let mut state = self.state.lock().expect("mux byte queue poisoned");
         state.closed = true;
         state.buffer.clear();
+        drop(state);
+        self.readable.notify_waiters();
+    }
+}
+
+impl DatagramQueue {
+    /// Creates an empty bounded datagram queue.
+    ///
+    /// Example: `(64, 128KiB)` bounds both tiny and large packet attacks.
+    pub(super) fn new(packet_capacity: usize, byte_capacity: usize) -> Self {
+        Self {
+            packet_capacity,
+            byte_capacity,
+            state: Mutex::new(DatagramQueueState {
+                packets: VecDeque::new(),
+                bytes: 0,
+                closed: false,
+            }),
+            readable: Notify::new(),
+        }
+    }
+
+    /// Enqueues one complete packet or drops it when either bound is full.
+    ///
+    /// Example: congestion returns `false`; callers continue serving sibling flows.
+    pub(super) fn push(&self, payload: Bytes) -> bool {
+        let mut state = self.state.lock().expect("mux datagram queue poisoned");
+        let Some(new_bytes) = state.bytes.checked_add(payload.len()) else {
+            return false;
+        };
+        if state.closed
+            || state.packets.len() >= self.packet_capacity
+            || new_bytes > self.byte_capacity
+        {
+            return false;
+        }
+        state.packets.push_back(DatagramPacket { payload });
+        state.bytes = new_bytes;
+        drop(state);
+        self.readable.notify_one();
+        true
+    }
+
+    /// Receives the next complete packet or `None` after association closure.
+    ///
+    /// Example: packet boundaries survive independently of adjacent packet sizes.
+    pub(super) async fn pop(&self) -> Option<DatagramPacket> {
+        loop {
+            let notified = self.readable.notified();
+            {
+                let mut state = self.state.lock().expect("mux datagram queue poisoned");
+                if let Some(packet) = state.packets.pop_front() {
+                    state.bytes = state.bytes.saturating_sub(packet.payload.len());
+                    return Some(packet);
+                }
+                if state.closed {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    /// Closes and discards an unordered UDP queue immediately.
+    ///
+    /// Example: carrier failure wakes a blocked association receiver with `None`.
+    pub(super) fn close(&self) {
+        let mut state = self.state.lock().expect("mux datagram queue poisoned");
+        state.closed = true;
+        state.packets.clear();
+        state.bytes = 0;
         drop(state);
         self.readable.notify_waiters();
     }

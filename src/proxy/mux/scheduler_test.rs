@@ -265,6 +265,73 @@ async fn bounded_control_priority_allows_data_progress() {
         .expect("DATA progressed");
 }
 
+/// Verifies a UDP packet burst cannot starve a pending TCP DATA frame.
+///
+/// Example: TCP DATA appears within one control burst while datagrams remain queued.
+#[tokio::test]
+async fn datagram_burst_allows_tcp_data_progress() {
+    let (carrier, mut received) = tokio::sync::mpsc::channel(1);
+    let outbound = Outbound::start(carrier, Frame::Fin { stream_id: 0 });
+    for marker in 0..(CONTROL_BURST_LIMIT as u8 * 2) {
+        assert!(outbound
+            .try_send_datagram(Frame::Datagram {
+                association_id: 3,
+                payload: Bytes::from(vec![marker]),
+            })
+            .expect("queue datagram"));
+    }
+    let sender = outbound.clone();
+    let data = tokio::spawn(send_data(sender, Bytes::from_static(b"data")));
+
+    assert!(matches!(
+        received.recv().await,
+        Some(Frame::Fin { stream_id: 0 })
+    ));
+    let mut datagrams = 0usize;
+    loop {
+        match received.recv().await.expect("scheduled frame") {
+            Frame::Data { stream_id: 1, .. } => break,
+            Frame::Datagram { .. } => datagrams += 1,
+            frame => panic!("unexpected frame: {frame:?}"),
+        }
+    }
+    assert!(datagrams <= 1);
+    data.await
+        .expect("join DATA sender")
+        .expect("DATA progressed");
+}
+
+/// Verifies UDP congestion cannot occupy lifecycle control capacity.
+///
+/// Example: a full lossy packet queue still accepts a stream FIN immediately.
+#[tokio::test]
+async fn full_datagram_queue_does_not_block_control() {
+    let (carrier, _received) = tokio::sync::mpsc::channel(1);
+    let outbound = Outbound::start(carrier, Frame::Fin { stream_id: 0 });
+    time::sleep(Duration::from_millis(10)).await;
+    let mut dropped = false;
+    for marker in 0..1024_u32 {
+        if !outbound
+            .try_send_datagram(Frame::Datagram {
+                association_id: 3,
+                payload: Bytes::copy_from_slice(&marker.to_be_bytes()),
+            })
+            .expect("queue datagram")
+        {
+            dropped = true;
+            break;
+        }
+    }
+    assert!(dropped);
+    time::timeout(
+        Duration::from_secs(1),
+        outbound.send_control(Frame::Fin { stream_id: 1 }),
+    )
+    .await
+    .expect("control capacity remained independent")
+    .expect("queue control");
+}
+
 /// Verifies carrier shutdown wakes a DATA producer with an explicit error.
 ///
 /// Example: dropping the sole carrier receiver fails the next pending handoff.

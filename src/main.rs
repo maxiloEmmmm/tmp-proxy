@@ -48,7 +48,7 @@ enum LaunchMode {
     Gui,
     /// Start the xx side without a GUI for diagnostics or server usage.
     Xx(XxConfig),
-    /// Start the yy side that exposes a local TCP listener.
+    /// Start the yy side that exposes local TCP and UDP listeners.
     Yy(YyConfig),
     /// Start yy-like proxying and run a local command with the chosen port.
     Zz(ZzConfig),
@@ -66,7 +66,7 @@ struct YyConfig {
     endpoint: endpoint::Spec,
     /// Proxy protocol selected once for all accepted TCP connections.
     mode: proxy::Mode,
-    /// Local TCP listener address used by yy.
+    /// Local TCP and UDP listener address used by yy.
     listen_addr: String,
 }
 
@@ -826,7 +826,7 @@ fn shell_quote_single(raw: &str) -> String {
     format!("'{}'", raw.replace('\'', "'\\''"))
 }
 
-/// Runs yy mode and exposes a local TCP listener.
+/// Runs yy mode and exposes one TCP entry for opaque HTTP and SOCKS5 traffic.
 ///
 /// Example: `tmp-proxy -yy wss://x/tcp?code=<uuid> 0.0.0.0:0`.
 async fn run_yy(config: YyConfig) -> Result<(), String> {
@@ -839,7 +839,7 @@ async fn run_yy(config: YyConfig) -> Result<(), String> {
     let addr = listener
         .local_addr()
         .map_err(|err| format!("read listen addr failed: {err}"))?;
-    println!("listening {addr}");
+    println!("listening TCP {addr}");
 
     loop {
         let (stream, peer) = listener

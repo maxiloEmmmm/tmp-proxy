@@ -1,8 +1,12 @@
-use std::time::Duration;
+use std::{net::SocketAddr, time::Duration};
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use tokio::{net::TcpStream, sync::mpsc, time};
+use tokio::{
+    net::{lookup_host, TcpStream, UdpSocket},
+    sync::mpsc,
+    time,
+};
 use tokio_tungstenite::{tungstenite::protocol::Message, WebSocketStream};
 use tokio_util::sync::CancellationToken;
 
@@ -15,6 +19,7 @@ use crate::{
 use super::{
     bridge::bridge_tcp,
     core::{Config, Endpoint, Role, RESET_OPEN_FAILED},
+    datagram::bridge_udp,
     protocol::{decode, encode, Frame},
 };
 
@@ -119,9 +124,70 @@ impl Server {
                         }
                     });
                 }
+                incoming = endpoint.accept_datagram() => {
+                    let incoming = incoming?;
+                    let connection_lease = match &activity {
+                        Some(activity) => match activity.try_begin() {
+                            Some(lease) => Some(lease),
+                            None => {
+                                incoming.reject(RESET_OPEN_FAILED).await?;
+                                continue;
+                            }
+                        },
+                        None => None,
+                    };
+                    let target_policy = self.target.clone();
+                    tokio::spawn(async move {
+                        let result = async {
+                            let requested_port = (incoming.target_port() != 0)
+                                .then_some(incoming.target_port());
+                            let target = match target_policy.resolve(requested_port) {
+                                Ok(target) => target,
+                                Err(_) => {
+                                    incoming.reject(RESET_OPEN_FAILED).await?;
+                                    return Ok::<(), String>(());
+                                }
+                            };
+                            match connect_udp(&target).await {
+                                Ok(socket) => {
+                                    let datagram = incoming.accept().await?;
+                                    let _connection_lease = connection_lease;
+                                    bridge_udp(socket, datagram).await
+                                }
+                                Err(_) => incoming.reject(RESET_OPEN_FAILED).await,
+                            }
+                        }.await;
+                        if let Err(error) = result {
+                            eprintln!("mux target datagram failed: {error}");
+                        }
+                    });
+                }
             }
         }
     }
+}
+
+/// Creates one connected target UDP socket using the address family's wildcard bind.
+///
+/// Example: target `127.0.0.1:9000` binds an ephemeral IPv4 socket and connects it.
+async fn connect_udp(target: &str) -> Result<UdpSocket, String> {
+    let address = lookup_host(target)
+        .await
+        .map_err(|error| format!("resolve target UDP {target} failed: {error}"))?
+        .next()
+        .ok_or_else(|| format!("target UDP {target} resolved no addresses"))?;
+    let bind_address = match address {
+        SocketAddr::V4(_) => "0.0.0.0:0",
+        SocketAddr::V6(_) => "[::]:0",
+    };
+    let socket = UdpSocket::bind(bind_address)
+        .await
+        .map_err(|error| format!("bind target UDP socket failed: {error}"))?;
+    socket
+        .connect(address)
+        .await
+        .map_err(|error| format!("connect target UDP {address} failed: {error}"))?;
+    Ok(socket)
 }
 
 /// Attaches a concrete Cloudflare WebSocket to the transport-independent mux core.
