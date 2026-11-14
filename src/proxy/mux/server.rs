@@ -100,13 +100,18 @@ impl Server {
                     let target_policy = self.target.clone();
                     tokio::spawn(async move {
                         let result = async {
-                            let requested_port = (incoming.target_port() != 0)
-                                .then_some(incoming.target_port());
-                            let target = match target_policy.resolve(requested_port) {
-                                Ok(target) => target,
-                                Err(_) => {
-                                    incoming.reject(RESET_OPEN_FAILED).await?;
-                                    return Ok::<(), String>(());
+                            let target = match incoming.direct_target() {
+                                Some(target) => target,
+                                None => {
+                                    let requested_port = (incoming.target_port() != 0)
+                                        .then_some(incoming.target_port());
+                                    match target_policy.resolve(requested_port) {
+                                        Ok(target) => target,
+                                        Err(_) => {
+                                            incoming.reject(RESET_OPEN_FAILED).await?;
+                                            return Ok::<(), String>(());
+                                        }
+                                    }
                                 }
                             };
                             match TcpStream::connect(&target).await {
@@ -139,13 +144,18 @@ impl Server {
                     let target_policy = self.target.clone();
                     tokio::spawn(async move {
                         let result = async {
-                            let requested_port = (incoming.target_port() != 0)
-                                .then_some(incoming.target_port());
-                            let target = match target_policy.resolve(requested_port) {
-                                Ok(target) => target,
-                                Err(_) => {
-                                    incoming.reject(RESET_OPEN_FAILED).await?;
-                                    return Ok::<(), String>(());
+                            let target = match incoming.direct_target() {
+                                Some(target) => target,
+                                None => {
+                                    let requested_port = (incoming.target_port() != 0)
+                                        .then_some(incoming.target_port());
+                                    match target_policy.resolve(requested_port) {
+                                        Ok(target) => target,
+                                        Err(_) => {
+                                            incoming.reject(RESET_OPEN_FAILED).await?;
+                                            return Ok::<(), String>(());
+                                        }
+                                    }
                                 }
                             };
                             match connect_udp(&target).await {

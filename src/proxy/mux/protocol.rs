@@ -1,10 +1,48 @@
 use bytes::{BufMut, Bytes, BytesMut};
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// Current mux wire version, used by both peers during the hello exchange.
 pub(super) const VERSION: u16 = 1;
 
 /// Bytes occupied by the common opcode and stream identifier header.
 const HEADER_LEN: usize = 5;
+
+/// Destination address supplied directly by an integrated sing-box outbound.
+///
+/// Example: `Domain("example.com")` preserves remote DNS routing at the daemon.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum DestinationAddress {
+    /// Concrete IPv4 destination.
+    Ipv4(Ipv4Addr),
+    /// Concrete IPv6 destination.
+    Ipv6(Ipv6Addr),
+    /// ASCII domain name encoded with the standard SOCKS address shape.
+    Domain(String),
+}
+
+/// Complete destination carried by a direct OPEN or DATAGRAM_OPEN frame.
+///
+/// Example: `example.com:443` lets the daemon connect without an intermediate SOCKS proxy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct Destination {
+    /// Host address or domain selected by sing-box routing.
+    pub(super) address: DestinationAddress,
+    /// Non-zero target transport port.
+    pub(super) port: u16,
+}
+
+impl Destination {
+    /// Formats one destination for Tokio TCP or UDP resolution.
+    ///
+    /// Example: IPv6 `::1` and port `22` becomes `[::1]:22`.
+    pub(super) fn connect_address(&self) -> String {
+        match &self.address {
+            DestinationAddress::Ipv4(address) => format!("{address}:{}", self.port),
+            DestinationAddress::Ipv6(address) => format!("[{address}]:{}", self.port),
+            DestinationAddress::Domain(address) => format!("{address}:{}", self.port),
+        }
+    }
+}
 
 /// Mux protocol frame carried by exactly one WebSocket binary message.
 ///
@@ -30,6 +68,13 @@ pub(super) enum Frame {
         stream_id: u32,
         /// Target TCP port requested from the remote proxy.
         target_port: u16,
+    },
+    /// Requests a direct daemon-side TCP connection to an original sing-box destination.
+    OpenDestination {
+        /// Logical stream identifier allocated by the opener.
+        stream_id: u32,
+        /// Original destination that replaces the legacy fixed target port.
+        destination: Destination,
     },
     /// Confirms that the requested target TCP connection is ready.
     OpenOk {
@@ -80,6 +125,13 @@ pub(super) enum Frame {
         association_id: u32,
         /// Fixed daemon-side UDP access port selected for the association.
         target_port: u16,
+    },
+    /// Opens one UDP association directly to the original sing-box destination.
+    DatagramOpenDestination {
+        /// Association identifier allocated by the opener.
+        association_id: u32,
+        /// Original connected UDP destination.
+        destination: Destination,
     },
     /// Confirms that a UDP datagram association is ready.
     DatagramOpenOk {
@@ -135,6 +187,10 @@ pub(super) fn encode(frame: Frame) -> Bytes {
             output.put_u16(target_port);
             output.freeze()
         }
+        Frame::OpenDestination {
+            stream_id,
+            destination,
+        } => encode_destination_frame(2, stream_id, &destination),
         Frame::OpenOk { stream_id } => frame_header(3, stream_id, 0).freeze(),
         Frame::OpenError { stream_id, code } => encode_code_frame(4, stream_id, code),
         Frame::Data { stream_id, payload } => {
@@ -157,6 +213,10 @@ pub(super) fn encode(frame: Frame) -> Bytes {
             output.put_u16(target_port);
             output.freeze()
         }
+        Frame::DatagramOpenDestination {
+            association_id,
+            destination,
+        } => encode_destination_frame(10, association_id, &destination),
         Frame::DatagramOpenOk { association_id } => frame_header(11, association_id, 0).freeze(),
         Frame::DatagramOpenError {
             association_id,
@@ -190,6 +250,10 @@ pub(super) fn decode(input: Bytes) -> Result<Frame, String> {
             stream_id,
             target_port: u16::from_be_bytes([payload[0], payload[1]]),
         }),
+        2 if stream_id != 0 => Ok(Frame::OpenDestination {
+            stream_id,
+            destination: decode_destination(&payload)?,
+        }),
         3 if stream_id != 0 && payload.is_empty() => Ok(Frame::OpenOk { stream_id }),
         4 if stream_id != 0 => decode_code(stream_id, &payload, true),
         5 if stream_id != 0 && !payload.is_empty() => Ok(Frame::Data { stream_id, payload }),
@@ -200,6 +264,10 @@ pub(super) fn decode(input: Bytes) -> Result<Frame, String> {
         10 if stream_id != 0 && payload.len() == 2 => Ok(Frame::DatagramOpen {
             association_id: stream_id,
             target_port: u16::from_be_bytes([payload[0], payload[1]]),
+        }),
+        10 if stream_id != 0 => Ok(Frame::DatagramOpenDestination {
+            association_id: stream_id,
+            destination: decode_destination(&payload)?,
         }),
         11 if stream_id != 0 && payload.is_empty() => Ok(Frame::DatagramOpenOk {
             association_id: stream_id,
@@ -216,6 +284,79 @@ pub(super) fn decode(input: Bytes) -> Result<Frame, String> {
             "invalid mux frame opcode={opcode} stream_id={stream_id}"
         )),
     }
+}
+
+/// Encodes one original destination using the standard SOCKS address representation.
+///
+/// Example: `example.com:443` becomes type 3, length, domain bytes, and port.
+fn encode_destination_frame(opcode: u8, stream_id: u32, destination: &Destination) -> Bytes {
+    let address_length = match &destination.address {
+        DestinationAddress::Ipv4(_) => 1 + 4,
+        DestinationAddress::Ipv6(_) => 1 + 16,
+        DestinationAddress::Domain(domain) => 2 + domain.len(),
+    };
+    let mut output = frame_header(opcode, stream_id, address_length + 2);
+    match &destination.address {
+        DestinationAddress::Ipv4(address) => {
+            output.put_u8(1);
+            output.extend_from_slice(&address.octets());
+        }
+        DestinationAddress::Ipv6(address) => {
+            output.put_u8(4);
+            output.extend_from_slice(&address.octets());
+        }
+        DestinationAddress::Domain(domain) => {
+            output.put_u8(3);
+            output.put_u8(domain.len() as u8);
+            output.extend_from_slice(domain.as_bytes());
+        }
+    }
+    output.put_u16(destination.port);
+    output.freeze()
+}
+
+/// Decodes and validates one direct destination without resolving its domain locally.
+///
+/// Example: type 1 plus four address bytes and port becomes an IPv4 destination.
+fn decode_destination(payload: &[u8]) -> Result<Destination, String> {
+    let Some(address_type) = payload.first().copied() else {
+        return Err("mux destination is truncated".to_string());
+    };
+    let (address, port_offset) = match address_type {
+        1 if payload.len() == 7 => (
+            DestinationAddress::Ipv4(Ipv4Addr::new(
+                payload[1], payload[2], payload[3], payload[4],
+            )),
+            5,
+        ),
+        4 if payload.len() == 19 => {
+            let mut octets = [0_u8; 16];
+            octets.copy_from_slice(&payload[1..17]);
+            (DestinationAddress::Ipv6(Ipv6Addr::from(octets)), 17)
+        }
+        3 if payload.len() >= 4 => {
+            let domain_length = payload[1] as usize;
+            let expected_length = 2_usize.saturating_add(domain_length).saturating_add(2);
+            if domain_length == 0 || payload.len() != expected_length {
+                return Err("invalid mux destination domain length".to_string());
+            }
+            let domain = std::str::from_utf8(&payload[2..2 + domain_length])
+                .map_err(|_| "mux destination domain is not UTF-8".to_string())?;
+            if !domain.is_ascii() || domain.chars().any(char::is_whitespace) {
+                return Err("mux destination domain must be non-whitespace ASCII".to_string());
+            }
+            (
+                DestinationAddress::Domain(domain.to_string()),
+                2 + domain_length,
+            )
+        }
+        _ => return Err("invalid mux destination address".to_string()),
+    };
+    let port = u16::from_be_bytes([payload[port_offset], payload[port_offset + 1]]);
+    if port == 0 {
+        return Err("mux destination port must be non-zero".to_string());
+    }
+    Ok(Destination { address, port })
 }
 
 /// Decodes one UDP association rejection without sharing TCP-specific naming.

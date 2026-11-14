@@ -3,9 +3,11 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::{sync::mpsc, time};
 
+use crate::proxy::mux::protocol::DestinationAddress;
+
 use super::{
-    Config, Endpoint, Role, DEFAULT_CONNECTION_WINDOW, DEFAULT_MAX_FRAME, DEFAULT_MAX_STREAMS,
-    DEFAULT_STREAM_WINDOW,
+    Config, Destination, Endpoint, Frame, Role, DEFAULT_CONNECTION_WINDOW, DEFAULT_MAX_FRAME,
+    DEFAULT_MAX_STREAMS, DEFAULT_STREAM_WINDOW, VERSION,
 };
 
 /// Verifies production defaults provide high-BDP throughput without weakening the global cap.
@@ -43,6 +45,105 @@ fn peer_pair(config: Config) -> (Endpoint, Endpoint) {
     )
     .expect("start server peer");
     (client, server)
+}
+
+/// Verifies a destination-bearing OPEN reaches the server without legacy port ambiguity.
+///
+/// Example: direct `192.0.2.154:22` reports target_port zero and its full direct target.
+#[tokio::test]
+async fn direct_tcp_destination_reaches_server_accept() {
+    let (carrier_out_tx, mut carrier_out_rx) = mpsc::channel(16);
+    let (carrier_in_tx, carrier_in_rx) = mpsc::channel(16);
+    let server = Endpoint::start(
+        Role::Server,
+        Config::default(),
+        carrier_out_tx,
+        carrier_in_rx,
+    )
+    .expect("start direct server");
+    assert!(matches!(
+        carrier_out_rx.recv().await,
+        Some(Frame::Hello { .. })
+    ));
+    carrier_in_tx
+        .send(test_hello())
+        .await
+        .expect("send remote hello");
+    carrier_in_tx
+        .send(Frame::OpenDestination {
+            stream_id: 1,
+            destination: Destination {
+                address: DestinationAddress::Ipv4("192.0.2.154".parse().expect("IPv4")),
+                port: 22,
+            },
+        })
+        .await
+        .expect("send direct OPEN");
+    let incoming = time::timeout(Duration::from_secs(1), server.accept())
+        .await
+        .expect("direct OPEN arrived")
+        .expect("accept direct OPEN");
+    assert_eq!(incoming.target_port(), 0);
+    assert_eq!(
+        incoming.direct_target().as_deref(),
+        Some("192.0.2.154:22")
+    );
+}
+
+/// Verifies direct UDP metadata preserves IPv6 bracket formatting for Tokio.
+///
+/// Example: `2001:db8::1:53` reaches the daemon as `[2001:db8::1]:53`.
+#[tokio::test]
+async fn direct_udp_destination_reaches_server_accept() {
+    let (carrier_out_tx, mut carrier_out_rx) = mpsc::channel(16);
+    let (carrier_in_tx, carrier_in_rx) = mpsc::channel(16);
+    let server = Endpoint::start(
+        Role::Server,
+        Config::default(),
+        carrier_out_tx,
+        carrier_in_rx,
+    )
+    .expect("start direct UDP server");
+    assert!(matches!(
+        carrier_out_rx.recv().await,
+        Some(Frame::Hello { .. })
+    ));
+    carrier_in_tx
+        .send(test_hello())
+        .await
+        .expect("send remote hello");
+    carrier_in_tx
+        .send(Frame::DatagramOpenDestination {
+            association_id: 1,
+            destination: Destination {
+                address: DestinationAddress::Ipv6("2001:db8::1".parse().expect("IPv6")),
+                port: 53,
+            },
+        })
+        .await
+        .expect("send direct DATAGRAM_OPEN");
+    let incoming = time::timeout(Duration::from_secs(1), server.accept_datagram())
+        .await
+        .expect("direct DATAGRAM_OPEN arrived")
+        .expect("accept direct DATAGRAM_OPEN");
+    assert_eq!(incoming.target_port(), 0);
+    assert_eq!(
+        incoming.direct_target().as_deref(),
+        Some("[2001:db8::1]:53")
+    );
+}
+
+/// Builds one valid remote HELLO for raw-frame core tests.
+///
+/// Example: a server receives these limits before accepting an OPEN.
+fn test_hello() -> Frame {
+    Frame::Hello {
+        version: VERSION,
+        stream_window: DEFAULT_STREAM_WINDOW,
+        connection_window: DEFAULT_CONNECTION_WINDOW,
+        max_frame: DEFAULT_MAX_FRAME,
+        max_streams: DEFAULT_MAX_STREAMS,
+    }
 }
 
 /// Opens one stream only after the server explicitly accepts its target port.

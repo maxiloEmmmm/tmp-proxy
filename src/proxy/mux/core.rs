@@ -11,7 +11,7 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify, Semaphore};
 
 use super::{
-    protocol::{Frame, VERSION},
+    protocol::{Destination, Frame, VERSION},
     queue::{ByteQueue, DatagramQueue},
     scheduler::Outbound,
     window::{RecvWindow, Reservation, SendWindow},
@@ -209,8 +209,8 @@ pub(super) struct SendPermit {
 ///
 /// Example: target port 10808 is connected before calling `accept`.
 pub(super) struct IncomingStream {
-    /// Target port requested by the client.
-    target_port: u16,
+    /// Legacy port override or direct original destination requested by the client.
+    target: IncomingTarget,
     /// Logical stream pending acceptance.
     stream: Option<Stream>,
 }
@@ -219,10 +219,21 @@ pub(super) struct IncomingStream {
 ///
 /// Example: the daemon binds an ephemeral UDP socket before accepting it.
 pub(super) struct IncomingDatagram {
-    /// Fixed target port requested when this association was opened.
-    target_port: u16,
+    /// Legacy port override or direct original UDP destination.
+    target: IncomingTarget,
     /// Logical association pending acceptance.
     datagram: Option<Datagram>,
+}
+
+/// Target shape accepted from old yy clients and integrated sing-box outbounds.
+///
+/// Example: old yy sends `Port(10808)` while CF outbound sends a direct destination.
+#[derive(Clone)]
+enum IncomingTarget {
+    /// Legacy daemon-side fixed-IP port override.
+    Port(u16),
+    /// Original destination connected directly by the daemon.
+    Destination(Destination),
 }
 
 impl Default for Config {
@@ -913,7 +924,20 @@ impl IncomingStream {
     ///
     /// Example: an HTTP proxy stream may request port 10808.
     pub(super) fn target_port(&self) -> u16 {
-        self.target_port
+        match self.target {
+            IncomingTarget::Port(port) => port,
+            IncomingTarget::Destination(_) => 0,
+        }
+    }
+
+    /// Returns a directly requested address when no legacy proxy hop is needed.
+    ///
+    /// Example: CF outbound `example.com:443` returns that complete address.
+    pub(super) fn direct_target(&self) -> Option<String> {
+        match &self.target {
+            IncomingTarget::Port(_) => None,
+            IncomingTarget::Destination(destination) => Some(destination.connect_address()),
+        }
     }
 
     /// Acknowledges target TCP readiness and returns the logical stream.
@@ -1006,7 +1030,20 @@ impl IncomingDatagram {
     ///
     /// Example: `10808` selects the daemon's configured host at UDP port 10808.
     pub(super) fn target_port(&self) -> u16 {
-        self.target_port
+        match self.target {
+            IncomingTarget::Port(port) => port,
+            IncomingTarget::Destination(_) => 0,
+        }
+    }
+
+    /// Returns a directly requested connected UDP target supplied by CF outbound.
+    ///
+    /// Example: CF outbound `1.1.1.1:53` returns that complete address.
+    pub(super) fn direct_target(&self) -> Option<String> {
+        match &self.target {
+            IncomingTarget::Port(_) => None,
+            IncomingTarget::Destination(destination) => Some(destination.connect_address()),
+        }
     }
 
     /// Acknowledges target UDP socket readiness and returns the association.
@@ -1098,7 +1135,19 @@ async fn handle_frame(inner: &Arc<EndpointInner>, frame: Frame) -> Result<(), St
         Frame::Open {
             stream_id,
             target_port,
-        } => handle_open(inner, &remote, stream_id, target_port).await,
+        } => handle_open(inner, &remote, stream_id, IncomingTarget::Port(target_port)).await,
+        Frame::OpenDestination {
+            stream_id,
+            destination,
+        } => {
+            handle_open(
+                inner,
+                &remote,
+                stream_id,
+                IncomingTarget::Destination(destination),
+            )
+            .await
+        }
         Frame::OpenOk { stream_id } => handle_open_ok(inner, stream_id),
         Frame::OpenError { stream_id, code } => handle_open_error(inner, stream_id, code).await,
         Frame::Data { stream_id, payload } => handle_data(inner, stream_id, payload).await,
@@ -1115,7 +1164,18 @@ async fn handle_frame(inner: &Arc<EndpointInner>, frame: Frame) -> Result<(), St
         Frame::DatagramOpen {
             association_id,
             target_port,
-        } => handle_datagram_open(inner, association_id, target_port).await,
+        } => handle_datagram_open(inner, association_id, IncomingTarget::Port(target_port)).await,
+        Frame::DatagramOpenDestination {
+            association_id,
+            destination,
+        } => {
+            handle_datagram_open(
+                inner,
+                association_id,
+                IncomingTarget::Destination(destination),
+            )
+            .await
+        }
         Frame::DatagramOpenOk { association_id } => {
             complete_datagram_open(inner, association_id, Ok(()))
         }
@@ -1180,7 +1240,7 @@ async fn handle_open(
     inner: &Arc<EndpointInner>,
     remote: &RemoteState,
     stream_id: u32,
-    target_port: u16,
+    target: IncomingTarget,
 ) -> Result<(), String> {
     if inner.role != Role::Server || stream_id % 2 == 0 {
         return Err("invalid remote mux OPEN".to_string());
@@ -1189,7 +1249,7 @@ async fn handle_open(
     inner
         .incoming
         .send(IncomingStream {
-            target_port,
+            target,
             stream: Some(stream),
         })
         .await
@@ -1202,7 +1262,7 @@ async fn handle_open(
 async fn handle_datagram_open(
     inner: &Arc<EndpointInner>,
     association_id: u32,
-    target_port: u16,
+    target: IncomingTarget,
 ) -> Result<(), String> {
     if inner.role != Role::Server || association_id % 2 == 0 {
         return Err("invalid remote mux DATAGRAM_OPEN".to_string());
@@ -1211,7 +1271,7 @@ async fn handle_datagram_open(
     inner
         .incoming_datagrams
         .send(IncomingDatagram {
-            target_port,
+            target,
             datagram: Some(datagram),
         })
         .await
