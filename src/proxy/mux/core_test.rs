@@ -133,6 +133,67 @@ async fn direct_udp_destination_reaches_server_accept() {
     );
 }
 
+/// Verifies the first UDP packet queues while the daemon target socket is still opening.
+///
+/// Example: DATAGRAM follows DATAGRAM_OPEN and reaches association 1 before OPEN_OK.
+#[tokio::test]
+async fn direct_udp_first_packet_queues_before_open_ok() {
+    let (carrier_out_tx, mut carrier_out_rx) = mpsc::channel(16);
+    let (carrier_in_tx, carrier_in_rx) = mpsc::channel(16);
+    let server = Endpoint::start(
+        Role::Server,
+        Config::default(),
+        carrier_out_tx,
+        carrier_in_rx,
+    )
+    .expect("start direct UDP server");
+    assert!(matches!(
+        carrier_out_rx.recv().await,
+        Some(Frame::Hello { .. })
+    ));
+    carrier_in_tx
+        .send(test_hello())
+        .await
+        .expect("send remote hello");
+    carrier_in_tx
+        .send(Frame::DatagramOpenDestination {
+            association_id: 1,
+            destination: Destination {
+                address: DestinationAddress::Ipv4("1.1.1.1".parse().expect("IPv4")),
+                port: 53,
+            },
+        })
+        .await
+        .expect("send direct DATAGRAM_OPEN");
+    carrier_in_tx
+        .send(Frame::Datagram {
+            association_id: 1,
+            payload: Bytes::from_static(b"first-query"),
+        })
+        .await
+        .expect("send first packet before OPEN_OK");
+
+    let incoming = server
+        .accept_datagram()
+        .await
+        .expect("accept pending datagram association");
+    let queued = incoming
+        .datagram
+        .as_ref()
+        .expect("pending association state")
+        .recv()
+        .await
+        .expect("receive pre-acknowledgement packet");
+    assert_eq!(&queued[..], b"first-query");
+
+    let accepted = incoming.accept().await.expect("acknowledge association");
+    assert_eq!(accepted.id(), 1);
+    assert!(matches!(
+        carrier_out_rx.recv().await,
+        Some(Frame::DatagramOpenOk { association_id: 1 })
+    ));
+}
+
 /// Builds one valid remote HELLO for raw-frame core tests.
 ///
 /// Example: a server receives these limits before accepting an OPEN.
