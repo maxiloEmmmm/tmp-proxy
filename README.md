@@ -1,6 +1,6 @@
 # tmp-proxy
 
-用 Rust 将本地服务接入 Cloudflare Quick Tunnel。连接端可以通过一条 WebSocket 同时转发多条 TCP 连接和 UDP 会话，并通过 Workers KV 跟随隧道地址和访问码的更新。
+将本地服务接入 Cloudflare Quick Tunnel。连接端可以通过一条 WebSocket 同时转发多条 TCP 连接和 UDP 会话，并通过 Workers KV 跟随隧道地址和访问码的更新。
 
 ```text
 应用 → tmp-proxy -yy / singbox-x → WSS → Cloudflare → tmp-proxy daemon → 目标服务
