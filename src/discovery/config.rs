@@ -16,6 +16,8 @@ pub(crate) enum BackendConfig {
 
 /// Values needed for Cloudflare KV reporting.
 pub(crate) struct CfKvConfig {
+    /// Account ID used for Workers KV requests.
+    pub(crate) account_id: String,
     /// Bearer token resolved from YAML or the named environment variable.
     pub(crate) token: String,
     /// Namespace title or 32-character namespace ID.
@@ -42,6 +44,8 @@ enum RawReporter {
     },
     /// Cloudflare KV credentials and namespace.
     CfKv {
+        /// Cloudflare account owning the namespace.
+        account_id: String,
         /// Literal API token, mutually exclusive with `token_env`.
         token: Option<String>,
         /// Name of an environment variable containing the API token.
@@ -103,11 +107,16 @@ fn validate_reporter(raw: RawReporter) -> Result<BackendConfig, String> {
             Ok(BackendConfig::CustomCenter(center))
         }
         RawReporter::CfKv {
+            account_id,
             token,
             token_env,
             namespace,
             prefix,
         } => {
+            let account_id = account_id.trim();
+            if account_id.len() != 32 || !account_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err("reporter.account_id must be a 32-character hexadecimal ID".to_string());
+            }
             let token = match (token, token_env) {
                 (Some(token), None) => token,
                 (None, Some(name)) if !name.trim().is_empty() => env::var(&name)
@@ -126,6 +135,7 @@ fn validate_reporter(raw: RawReporter) -> Result<BackendConfig, String> {
                 return Err("reporter.prefix must not be empty".to_string());
             }
             Ok(BackendConfig::CfKv(CfKvConfig {
+                account_id: account_id.to_string(),
                 token,
                 namespace: namespace.trim().to_string(),
                 prefix: prefix.trim().to_string(),

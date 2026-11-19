@@ -9,8 +9,11 @@
 set -euo pipefail
 
 : "${CF_TOKEN:?CF_TOKEN must be exported}"
+: "${CF_ACCOUNT_ID:?CF_ACCOUNT_ID must be exported}"
+: "${CF_KV_NAMESPACE_ID:?CF_KV_NAMESPACE_ID must be exported}"
+: "${CF_KV_KEY:?CF_KV_KEY must be exported}"
 unit=tmp-proxy-daemon.service
-kv_url=https://api.cloudflare.com/client/v4/accounts/00000000000000000000000000000000/storage/kv/namespaces/11111111111111111111111111111111/values/cfp/demo
+kv_url=https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/values/${CF_KV_KEY}
 
 for _ in {1..60}; do
     if ! systemctl is-active --quiet "$unit"; then
@@ -31,8 +34,8 @@ for _ in {1..60}; do
         | awk '/^code: / {code=$2} END {print code}')
     if [[ -n "$current_code" ]] && curl --fail --silent --max-time 5 \
         -H "Authorization: Bearer ${CF_TOKEN}" "$kv_url" \
-        | jq -e --arg code "$current_code" \
-            '.key == "demo" and .code == $code and .cf != ""' >/dev/null 2>&1; then
+        | jq -e --arg code "$current_code" --arg key "${CF_KV_KEY##*/}" \
+            '.key == $key and .code == $code and .cf != ""' >/dev/null 2>&1; then
         echo "systemd daemon KV ok"
         exit 0
     fi

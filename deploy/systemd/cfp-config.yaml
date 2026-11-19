@@ -1,5 +1,6 @@
 reporter:
   type: cf_kv
+  account_id: "<cloudflare-account-id>"
   token_env: CF_TOKEN
   namespace: proxy
-  prefix: com
+  prefix: cfp

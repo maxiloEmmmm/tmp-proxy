@@ -10,13 +10,16 @@ set -euo pipefail
 
 binary=${1:?"usage: cloudflare_kv.sh <binary>"}
 : "${CF_TOKEN:?CF_TOKEN must be exported}"
+: "${CF_ACCOUNT_ID:?CF_ACCOUNT_ID must be exported}"
+: "${CF_KV_NAMESPACE_ID:?CF_KV_NAMESPACE_ID must be exported}"
 
 work_dir=$(mktemp -d)
+: "${CF_KV_NAMESPACE:?CF_KV_NAMESPACE must be exported}"
 target_port=$(shuf -i 20000-45000 -n 1)
 center_port=$(shuf -i 45001-60000 -n 1)
 key="e2e-$(date +%s)-${RANDOM}"
 prefix="cfp-e2e"
-kv_url="https://api.cloudflare.com/client/v4/accounts/00000000000000000000000000000000/storage/kv/namespaces/11111111111111111111111111111111/values/${prefix}/${key}"
+kv_url="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/values/${prefix}/${key}"
 target_pid=
 center_pid=
 daemon_pid=
@@ -93,8 +96,9 @@ daemon_pid=
 cat >"$work_dir/kv.yaml" <<EOF
 reporter:
   type: cf_kv
+  account_id: "${CF_ACCOUNT_ID}"
   token_env: CF_TOKEN
-  namespace: proxy
+  namespace: "${CF_KV_NAMESPACE}"
   prefix: ${prefix}
 EOF
 
@@ -126,7 +130,7 @@ for _ in {1..30}; do
     if curl --fail --silent --max-time 5 --get \
         --data-urlencode "prefix=${prefix}/${key}" \
         -H "Authorization: Bearer ${CF_TOKEN}" \
-        "https://api.cloudflare.com/client/v4/accounts/00000000000000000000000000000000/storage/kv/namespaces/11111111111111111111111111111111/keys" \
+        "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/keys" \
         | jq -e --arg name "${prefix}/${key}" --argjson now "$(date +%s)" \
             '.result[]? | select(.name == $name and .expiration >= ($now + 10740) and .expiration <= ($now + 10860))' \
         >/dev/null 2>&1; then

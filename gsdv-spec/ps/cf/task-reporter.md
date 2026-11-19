@@ -14,7 +14,7 @@ daemon 的 discovery 上报目前固定为 3 秒一次 POST 到局域网 center�
   - 每 1 小时上报一次 + 变更即写：UUID 轮换（24h）或隧道刷新换域名时立即上报，
     不等下个周期
   - 记录带固定 expiration_ttl = 3h；不提供周期和 TTL 配置项
-  - REST API 的 account id 使用下方已验证账号，不增加配置项
+  - `account_id` 填 Cloudflare 账号 ID，KV 请求使用该账号
   - KV 网络错误、超时、HTTP 429 或 5xx 每 1 分钟重试，直到成功后恢复每小时上报
   - 其他 4xx 或配置错误只记录错误并等待下一次正常上报，不退出 daemon
 - 默认配置文件缺失则不上报；`CFP_CONFIG` 指向的文件缺失或已读取文件无效时启动报错；
@@ -24,12 +24,11 @@ daemon 的 discovery 上报目前固定为 3 秒一次 POST 到局域网 center�
   ```yaml
   reporter:
     type: cf_kv
+    account_id: "<cloudflare-account-id>"
     token_env: CF_TOKEN
     namespace: proxy
     prefix: cfp
   ```
 
   `custom_center` 使用 `type: custom_center` 和 `host: 127.0.0.1:9000`。
-- 凭据已验证：`CF_TOKEN`（~/.dev.env）、账号 00000000000000000000000000000000、
-  ns `proxy`（11111111111111111111111111111111）
 - 验收：cargo build 通过；两种后端各跑通一次上报；KV 模式写入-读回-清理无残留

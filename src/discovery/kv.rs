@@ -10,7 +10,6 @@ use tokio::sync::RwLock;
 use crate::discovery::config::CfKvConfig;
 use crate::discovery::Report;
 
-const ACCOUNT_ID: &str = "00000000000000000000000000000000";
 const API_BASE: &str = "https://api.cloudflare.com/client/v4";
 const EXPIRATION_TTL_SECONDS: u64 = 3 * 60 * 60;
 const API_TIMEOUT: Duration = Duration::from_secs(10);
@@ -61,6 +60,8 @@ impl fmt::Display for KvWriteError {
 pub(crate) struct KvBackend {
     /// HTTP client shared by namespace lookups and report writes.
     client: Client,
+    /// Cloudflare account used in KV request paths.
+    account_id: String,
     /// Bearer token kept out of logs.
     token: String,
     /// Namespace title or ID from config.
@@ -119,6 +120,7 @@ impl KvBackend {
             .map_err(|error| format!("create Cloudflare HTTP client failed: {error}"))?;
         Ok(Self {
             client,
+            account_id: config.account_id,
             token: config.token,
             namespace: config.namespace,
             namespace_id: RwLock::new(namespace_id),
@@ -137,7 +139,7 @@ impl KvBackend {
             let mut segments = url.path_segments_mut().map_err(|_| {
                 KvWriteError::Permanent("CF API URL cannot contain path segments".to_string())
             })?;
-            segments.extend(["accounts", ACCOUNT_ID, "storage", "kv", "namespaces"]);
+            segments.extend(["accounts", &self.account_id, "storage", "kv", "namespaces"]);
             segments.push(&namespace_id);
             segments.push("values");
             // 触发条件: key 带业务分组前缀，分隔符是实际的 `/`。
@@ -188,7 +190,8 @@ impl KvBackend {
         let mut page = 1;
         loop {
             let endpoint = format!(
-                "{API_BASE}/accounts/{ACCOUNT_ID}/storage/kv/namespaces?page={page}&per_page={NAMESPACES_PER_PAGE}"
+                "{API_BASE}/accounts/{}/storage/kv/namespaces?page={page}&per_page={NAMESPACES_PER_PAGE}",
+                self.account_id
             );
             let response = self
                 .client
@@ -270,6 +273,8 @@ pub(crate) struct KvEndpoint {
 pub(crate) struct KvReader {
     /// HTTP client shared by namespace lookup and value reads.
     client: Client,
+    /// Cloudflare account used in KV request paths.
+    account_id: String,
     /// Bearer token kept out of logs.
     token: String,
     /// Namespace title or ID from configuration.
@@ -303,6 +308,7 @@ impl KvReader {
             .map_err(|error| format!("create Cloudflare HTTP client failed: {error}"))?;
         Ok(Self {
             client,
+            account_id: config.account_id,
             token: config.token,
             namespace: config.namespace,
             namespace_id: RwLock::new(namespace_id),
@@ -330,7 +336,7 @@ impl KvReader {
             let mut segments = url
                 .path_segments_mut()
                 .map_err(|_| "CF API URL cannot contain path segments".to_string())?;
-            segments.extend(["accounts", ACCOUNT_ID, "storage", "kv", "namespaces"]);
+            segments.extend(["accounts", &self.account_id, "storage", "kv", "namespaces"]);
             segments.push(&namespace_id);
             segments.push("values");
             for part in key.split('/') {
@@ -377,7 +383,8 @@ impl KvReader {
         let mut page = 1;
         loop {
             let endpoint = format!(
-                "{API_BASE}/accounts/{ACCOUNT_ID}/storage/kv/namespaces?page={page}&per_page={NAMESPACES_PER_PAGE}"
+                "{API_BASE}/accounts/{}/storage/kv/namespaces?page={page}&per_page={NAMESPACES_PER_PAGE}",
+                self.account_id
             );
             let response = self
                 .client
